@@ -1,0 +1,15 @@
+{
+    "ui":  {
+               "logical_w":  640,
+               "logical_h":  480,
+               "margin_x":  "auto",
+               "margin_y":  "auto"
+           },
+    "video":  {
+                  "mpv_args":  [
+                                   "--vf=lavfi=[scale=640:480:force_original_aspect_ratio=increase,crop=640:480]"
+                               ]
+              },
+    "search_count":  10,
+    "quality":  480
+}
