@@ -1,14 +1,14 @@
 name: Release diario (yt-dlp aarch64 + codigo)
 
 # Una vez al dia comprueba si yt-dlp publico una version nueva para ARM64.
-# Si la hay (o si se lanza a mano), genera un release de este repo con:
-#   - yt-dlp_linux_aarch64          binario suelto (verificado por SHA-256)
-#   - yt-dlp_linux_aarch64.sha256   hash oficial
-#   - version.txt                   version de yt-dlp incluida
-#   - YouTubePy-<ver>.zip           codigo completo + binario, listo para
-#                                   descomprimir en /roms/ports
-# Ademas mantiene el tag movil "ytdlp-latest" con los mismos assets, que es
-# el que usa la app para autoactualizarse (URL fija).
+# Si la hay (o si se lanza a mano), genera un release de este repo con un
+# unico asset:
+#   - YouTubePy-<ver>.zip   codigo completo + yt-dlp_linux_aarch64 ya puesto
+#                           en youtube_py/yt-dlp.real (verificado por SHA-256),
+#                           listo para descomprimir en /roms/ports
+# Ademas mantiene el tag movil "ytdlp-latest" con el mismo zip, para tener
+# una URL de descarga estable.
+# La app NO usa estos releases para actualizarse: baja yt-dlp del repo oficial.
 
 on:
   schedule:
@@ -70,8 +70,6 @@ jobs:
           [ "$(stat -c%s yt-dlp_linux_aarch64)" -ge 10000000 ] \
             || { echo "binario demasiado pequeno"; exit 1; }
           file yt-dlp_linux_aarch64 | grep -qi 'aarch64'
-          cut -d' ' -f1 expected.sha256 > yt-dlp_linux_aarch64.sha256
-          echo "$V" > version.txt
 
       - name: Empaquetar codigo + binario
         if: steps.have.outputs.skip == 'false'
@@ -115,7 +113,7 @@ jobs:
           ya incluido en \`youtube_py/yt-dlp.real\`, verificado por SHA-256).
 
           Upstream: https://github.com/yt-dlp/yt-dlp/releases/tag/$V" \
-            "$ZIP" version.txt
+            "$ZIP"
 
       - name: Actualizar tag movil ytdlp-latest
         if: steps.have.outputs.skip == 'false'
@@ -134,4 +132,4 @@ jobs:
 
           Descarga \`YouTubePy-latest.zip\` y descomprimelo en \`/roms/ports\`;
           incluye el codigo y el binario ARM64 ya verificado." \
-            YouTubePy-latest.zip version.txt
+            YouTubePy-latest.zip
