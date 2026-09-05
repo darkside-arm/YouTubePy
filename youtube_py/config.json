@@ -6,7 +6,7 @@
                "margin_y":  "auto"
            },
     "video":  {
-                  "players":  [ "mpv", "cvlc", "vlc" ],
+                  "players":  [ "mpv" ],
                   "mpv_args":  [
                                    "--vo=drm",
                                    "--vf=lavfi=[scale=640:480:force_original_aspect_ratio=increase,crop=640:480]",
@@ -14,22 +14,6 @@
                                    "--cache-secs=30",
                                    "--demuxer-max-bytes=64MiB",
                                    "--demuxer-readahead-secs=20"
-                               ],
-                  "cvlc_args":  [
-                                    "--vout=fb",
-                                    "--no-fb-tty",
-                                    "--avcodec-hw=none",
-                                    "--aout=alsa",
-                                    "--network-caching=30000",
-                                    "--no-video-title-show"
-                                ],
-                  "vlc_args":  [
-                                   "--vout=fb",
-                                   "--no-fb-tty",
-                                   "--avcodec-hw=none",
-                                   "--aout=alsa",
-                                   "--network-caching=30000",
-                                   "--no-video-title-show"
                                ]
               },
     "search_count":  10,

@@ -41,39 +41,19 @@ def _margin(axis):
     return _auto_margin() if v == "auto" else int(v)
 
 
-# Reproductores por orden de preferencia. mpv es el bueno, pero no viene en
-# todas las imagenes (DarkOS 13 no lo trae), asi que hay un respaldo.
-# ffplay queda descartado: no admite pista de audio separada (DASH sin
-# sonido) y no expone control de buffer de red.
-PLAYERS = ("mpv", "cvlc", "vlc")
+# mpv es el unico reproductor soportado. Se probaron dos alternativas y las
+# dos se descartaron:
+#   - ffplay: no admite pista de audio separada (DASH sin sonido) y no expone
+#     control del buffer de red.
+#   - vlc/cvlc: se niega a correr como root (el launcher usa sudo), su unica
+#     salida de video es el framebuffer y decodifica por software; incluso
+#     degradando privilegios el resultado va a tirones.
+# Si la consola no trae mpv, el port se lo descarga (ver _install_mpv).
+PLAYERS = ("mpv",)
 
 # Directorios donde buscar el binario. BASE/bin va primero por si el port
 # trae su propio mpv empaquetado.
 PLAYER_DIRS = (os.path.join(BASE, "bin"), "/usr/bin", "/usr/local/bin", "/bin")
-
-
-def _is_root():
-    return hasattr(os, "geteuid") and os.geteuid() == 0
-
-
-def _desktop_user():
-    """Usuario normal al que degradar privilegios (VLC no arranca como root).
-
-    El launcher hace 'sudo env ... python3 main.py', asi que SUDO_USER trae
-    el usuario original. Si no, se busca el primer UID 1000 (ark en ArkOS
-    y DarkOS)."""
-    u = os.environ.get("SUDO_USER") or ""
-    if u and u != "root":
-        return u
-    try:
-        with open("/etc/passwd") as f:
-            for line in f:
-                p = line.split(":")
-                if len(p) > 2 and p[2] == "1000":
-                    return p[0]
-    except OSError:
-        pass
-    return ""
 
 
 def _find_exe(name):
@@ -84,33 +64,12 @@ def _find_exe(name):
     return None
 
 
-def _drop_prefix(name):
-    """Prefijo para lanzar VLC como usuario normal.
-
-    VLC aborta con 'VLC is not supposed to be run as root', y el port corre
-    como root porque PortMaster lo lanza con sudo. Devuelve None si no hay
-    forma de degradar, para que ese reproductor se descarte."""
-    if name not in ("vlc", "cvlc") or not _is_root():
-        return []
-    user = _desktop_user()
-    sudo = _find_exe("sudo")
-    if not user or not sudo:
-        return None
-    home = os.path.expanduser("~" + user)
-    if not os.path.isdir(home):
-        home = "/tmp"
-    return [sudo, "-u", user, "env", "HOME=" + home]
-
-
 def _which_player():
-    """Primer reproductor disponible y utilizable en este entorno."""
+    """Primer reproductor disponible."""
     for name in CFG.get("video", {}).get("players", PLAYERS):
         path = _find_exe(name)
-        if not path:
-            continue
-        if _drop_prefix(name) is None:
-            continue   # VLC como root y sin forma de degradar: inservible
-        return name, path
+        if path:
+            return name, path
     return None, None
 
 
@@ -131,33 +90,22 @@ def _player_env():
 
 
 def _player_cmd(name, path, url, audio_url):
-    """Linea de comandos del reproductor, con la pista de audio separada
-    cuando el formato es DASH (audio_url no es None)."""
+    """Linea de comandos de mpv, con la pista de audio separada cuando el
+    formato es DASH (audio_url no es None)."""
     extra = CFG.get("video", {}).get(name + "_args", [])
-    if name == "mpv":
-        cmd = [path, "--fs", "--no-terminal", "--really-quiet"]
-        if audio_url:
-            cmd.append("--audio-file=" + audio_url)
-        return cmd + extra + [url]
-    # vlc / cvlc. cvlc ya es un wrapper que hace "vlc -I dummy", asi que
-    # solo hay que forzar la interfaz nula cuando se invoca vlc a secas.
-    cmd = [path, "--play-and-exit", "--no-osd"]
-    if name == "vlc":
-        cmd[1:1] = ["-I", "dummy"]
+    cmd = [path, "--fs", "--no-terminal", "--really-quiet"]
     if audio_url:
-        cmd.append("--input-slave=" + audio_url)
-    return (_drop_prefix(name) or []) + cmd + extra + [url]
+        cmd.append("--audio-file=" + audio_url)
+    return cmd + extra + [url]
 
 
 NO_PLAYER_TEXT = [
-    "No se encontro ningun reproductor de video usable.",
+    "No hay reproductor de video y no se pudo descargar.",
     "",
-    "Instala mpv en la consola (por SSH o terminal):",
-    "  sudo apt install mpv",
-    "",
-    "VLC sirve de respaldo, pero se niega a correr como",
-    "root: hace falta el usuario ark y sudo para bajarle",
-    "los privilegios.",
+    "Opciones:",
+    "  - Reintentar con mejor conexion WiFi.",
+    "  - Instalarlo en la consola por SSH:",
+    "      sudo apt install mpv",
 ]
 
 
@@ -439,7 +387,7 @@ class App(object):
             daemon=True).start()
 
         # Reproductor: se comprueba al arrancar, no al pulsar play, para que
-        # el usuario se entere del problema antes de elegir un video.
+        # el usuario se entere antes de elegir un video.
         if _which_player()[0] is None:
             self._install_mpv()
 
@@ -656,19 +604,23 @@ class App(object):
 
     # ---------- playback ----------
     def _install_mpv(self):
-        """Descarga la dependencia mpv (~4 MB) tras confirmar con el usuario.
+        """Descarga mpv (~4 MB) tras PEDIR CONFIRMACION al usuario.
 
-        No instala nada en el sistema: queda en youtube_py/{bin,lib} y solo
-        la usa el reproductor. Devuelve True si mpv quedo disponible."""
+        No instala nada en el sistema ni toca apt: el binario y sus librerias
+        quedan en youtube_py/{bin,lib} y solo los usa el reproductor.
+        Devuelve True si mpv quedo disponible."""
         ev = sdl2.SDL_Event()
         choice = [None]
         info = [
-            "Esta consola no trae ningun reproductor de video.",
+            "Falta mpv, el reproductor de video.",
             "",
-            "Puedo descargar mpv (unos 4 MB) dentro de la",
-            "carpeta del port. No se instala nada en el",
-            "sistema y se borra quitando la carpeta.",
+            "Puedo descargarlo (unos 4 MB) dentro de la",
+            "carpeta del port: bin/mpv y lib/.",
+            "",
+            "No se instala nada en el sistema ni se usa apt.",
+            "Para quitarlo basta con borrar esas carpetas.",
         ]
+        footer = "A = descargar    B = cancelar"
         while choice[0] is None and self.running:
             while sdl2.SDL_PollEvent(ctypes.byref(ev)):
                 if ev.type == sdl2.SDL_QUIT:
@@ -679,8 +631,7 @@ class App(object):
                         choice[0] = "yes"
                     elif b == "B":
                         choice[0] = "no"
-            self._modal_box("Falta un reproductor de video", info,
-                            "A = descargar mpv    B = cancelar")
+            self._modal_box("Descargar reproductor de video", info, footer)
             sdl2.SDL_RenderPresent(self.ren)
             sdl2.SDL_Delay(50)
         if choice[0] != "yes":
