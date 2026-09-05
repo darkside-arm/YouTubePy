@@ -69,6 +69,11 @@ jobs:
           # Incluye libgbm de mesa porque DarkOS/ArkOS sustituyen libgbm.so.1
           # por un symlink a libMali.so, que no exporta
           # gbm_surface_create_with_modifiers y hace que mpv aborte al arrancar.
+          #
+          # NO incluye un runtime JS (quickjs): habilitaria los formatos DASH
+          # de 480p, pero ejecutar el javascript del reproductor de YouTube en
+          # un Cortex-A35 cuesta ~100 s por video, frente a los ~10 s del
+          # cliente android con el itag 18 (360p). Medido, no estimado.
           set -e
           rm -rf debs mpvroot mpvpkg && mkdir -p debs mpvroot mpvpkg/bin mpvpkg/lib
           # Las rutas se resuelven contra el indice de TRIXIE, no listando el

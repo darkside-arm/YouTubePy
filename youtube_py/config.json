@@ -9,7 +9,6 @@
                   "players":  [ "mpv" ],
                   "mpv_args":  [
                                    "--vo=drm",
-                                   "--vf=lavfi=[scale=640:480:force_original_aspect_ratio=increase,crop=640:480]",
                                    "--cache=yes",
                                    "--cache-secs=30",
                                    "--demuxer-max-bytes=64MiB",
@@ -17,5 +16,6 @@
                                ]
               },
     "search_count":  10,
-    "quality":  480
+    "quality":  480,
+    "lang":  "en"
 }

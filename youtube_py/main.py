@@ -89,11 +89,211 @@ def _player_env():
     return env
 
 
-def _player_cmd(name, path, url, audio_url):
+# Modos de encaje del video. La pantalla es 4:3 (640x480) y casi todo
+# YouTube es 16:9, asi que algo hay que sacrificar. Medido en la R36S con un
+# 360p: sin escalado 80% de CPU, con recorte a pantalla completa 120-138%.
+# Por eso "fit" es el primero: ademas de no cortar nada, es el mas barato.
+ASPECT_MODES = [
+    ("aspect_fit", "aspect_fit_hint",
+     ["--keepaspect=yes", "--panscan=0.0"]),
+    ("aspect_fill", "aspect_fill_hint",
+     ["--keepaspect=yes", "--panscan=1.0"]),
+    ("aspect_stretch", "aspect_stretch_hint",
+     ["--keepaspect=no"]),
+]
+# Comandos equivalentes para cambiarlo en caliente por IPC.
+ASPECT_IPC = [
+    [["set", "keepaspect", "yes"], ["set", "panscan", "0"]],
+    [["set", "keepaspect", "yes"], ["set", "panscan", "1"]],
+    [["set", "keepaspect", "no"]],
+]
+# Aviso en pantalla al cambiar de modo. mpv expande ${...} con sus propias
+# propiedades, asi que el tamano real del video lo pone el.
+ASPECT_OSD_MS = 1800
+# El socket va en /tmp (tmpfs): /roms suele ser exFAT y no admite sockets.
+MPV_SOCKET = "/tmp/youtubepy-mpv.sock"
+
+
+def _vlog(msg):
+    """Traza a log.txt. Durante el video no hay UI donde mostrar nada, asi
+    que sin esto es imposible saber si un boton llego a registrarse."""
+    sys.stderr.write("video: %s\n" % msg)
+    sys.stderr.flush()
+
+
+def _osd_setup_ipc():
+    """Mismos ajustes que _osd_args pero por IPC.
+
+    Se reenvian con cada aviso: asi el texto sale centrado y en amarillo
+    aunque mpv se hubiera lanzado sin esos parametros (por ejemplo tras
+    actualizar el codigo con un video ya en marcha)."""
+    _, h = _screen_size()
+    return [
+        ["set", "osd-align-x", "center"],
+        ["set", "osd-align-y", "center"],
+        ["set", "osd-scale-by-window", "no"],
+        ["set", "osd-font-size", str(max(20, h // 12))],
+        ["set", "osd-color", "#FFFF00"],
+        ["set", "osd-border-color", "#000000"],
+        ["set", "osd-border-size", "3"],
+    ]
+
+
+def _mpv_query(props, timeout=1.0):
+    """Lee propiedades de mpv por IPC. Devuelve dict {prop: valor}.
+
+    Hace falta porque show-text NO expande ${...} cuando el comando llega por
+    el socket: el texto sale literal. Asi que los valores se piden antes y se
+    interpolan aqui."""
+    import socket
+    import time
+    out = {}
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(MPV_SOCKET)
+        for i, p in enumerate(props):
+            s.sendall((json.dumps({"command": ["get_property", p],
+                                   "request_id": i}) + "\n").encode())
+        time.sleep(0.25)
+        data = s.recv(65536).decode(errors="replace")
+        s.close()
+        for line in data.splitlines():
+            try:
+                j = json.loads(line)
+            except ValueError:
+                continue
+            rid = j.get("request_id")
+            if isinstance(rid, int) and rid < len(props):
+                out[props[rid]] = j.get("data")
+    except OSError:
+        pass
+    return out
+
+
+def _ratio_text(w, h):
+    """'854x480 - 16:9'. Sin la relacion no se entiende por que un modo no
+    cambia nada: en un video 4:3 los tres se ven igual."""
+    if not w or not h:
+        return ""
+    try:
+        from fractions import Fraction
+        f = Fraction(int(w), int(h)).limit_denominator(30)
+        return "%dx%d - %d:%d" % (w, h, f.numerator, f.denominator)
+    except (ValueError, ZeroDivisionError):
+        return "%sx%s" % (w, h)
+
+
+def _mpv_ipc(commands, retries=3):
+    """Envia comandos a mpv por su socket IPC.
+
+    mpv crea el socket un poco despues de arrancar, y el primer intento puede
+    llegar antes de tiempo; de ahi los reintentos. Devuelve True si se
+    enviaron. Los fallos se anotan en el log, que si no era imposible saber
+    por que un boton "no hacia nada"."""
+    import socket
+    import time
+    for attempt in range(retries):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect(MPV_SOCKET)
+            for i, c in enumerate(commands):
+                s.sendall((json.dumps({"command": c,
+                                       "request_id": i}) + "\n").encode())
+            # NO cerrar sin mas: mpv procesa el socket de forma asincrona y
+            # cerrarlo justo despues del sendall descarta lo pendiente. Hay
+            # que esperar a que conteste, que ademas confirma que se ejecuto.
+            ok = _wait_replies(s, len(commands))
+            s.close()
+            if ok:
+                return True
+        except OSError as e:
+            if attempt == retries - 1:
+                sys.stderr.write("mpv ipc: %s (%s)\n" % (e, MPV_SOCKET))
+                sys.stderr.flush()
+        time.sleep(0.15)
+    return False
+
+
+def _wait_replies(sock, n, timeout=1.0):
+    """Espera las respuestas de mpv a n comandos. True si llegaron todas."""
+    import time
+    seen = set()
+    buf = ""
+    end = time.time() + timeout
+    while time.time() < end and len(seen) < n:
+        try:
+            chunk = sock.recv(65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf += chunk.decode(errors="replace")
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            if not line.strip():
+                continue
+            try:
+                j = json.loads(line)
+            except ValueError:
+                continue
+            rid = j.get("request_id")
+            if rid is None:
+                continue          # evento, no respuesta
+            seen.add(rid)
+            if j.get("error") not in (None, "success"):
+                sys.stderr.write("mpv ipc: comando %s -> %s\n"
+                                 % (rid, j.get("error")))
+                sys.stderr.flush()
+    return len(seen) >= n
+
+
+def _screen_size():
+    """Resolucion real de la pantalla, leida del framebuffer.
+
+    Se usa para dimensionar el OSD de mpv. Si no se puede leer, se cae a la
+    resolucion logica de la UI."""
+    try:
+        with open("/sys/class/graphics/fb0/virtual_size") as f:
+            w, h = f.read().strip().split(",")
+            return int(w), int(h)
+    except (OSError, ValueError):
+        return LW, LH
+
+
+def _osd_args():
+    """OSD de mpv: centrado, amarillo y proporcional a la pantalla.
+
+    Va CENTRADO a proposito: por defecto mpv lo pinta en la esquina superior
+    izquierda, que en estas consolas queda tapada por el bisel de la carcasa.
+    El tamano se calcula desde la altura real (1/12 de la pantalla) y se
+    desactiva el escalado propio de mpv, que toma 720p como referencia y
+    dejaria la letra a dos tercios en un panel de 480."""
+    _, h = _screen_size()
+    return [
+        "--osd-align-x=center",
+        "--osd-align-y=center",
+        "--osd-scale-by-window=no",
+        "--osd-font-size=%d" % max(20, h // 12),
+        "--osd-color=#FFFF00",          # amarillo
+        "--osd-border-color=#000000",
+        "--osd-border-size=3",
+        "--osd-duration=2000",
+    ]
+
+
+def _player_cmd(name, path, url, audio_url, aspect=0):
     """Linea de comandos de mpv, con la pista de audio separada cuando el
     formato es DASH (audio_url no es None)."""
     extra = CFG.get("video", {}).get(name + "_args", [])
-    cmd = [path, "--fs", "--no-terminal", "--really-quiet"]
+    cmd = [path, "--fs", "--no-terminal", "--really-quiet",
+           "--input-ipc-server=" + MPV_SOCKET,
+           # Aviso al empezar: sin barra de ayuda durante el video, nadie
+           # adivinaria que A pausa o que Y cambia el encaje.
+           "--osd-playing-msg=" + T("osd_hint")]
+    cmd += _osd_args()
+    cmd += ASPECT_MODES[aspect % len(ASPECT_MODES)][2]
     if audio_url:
         cmd.append("--audio-file=" + audio_url)
     return cmd + extra + [url]
@@ -127,9 +327,97 @@ C_BADGE = (0, 0, 0)
 C_MODAL = (45, 48, 58)
 
 BTN_COLORS = {"A": (200, 40, 40), "B": (220, 180, 30),
-              "X": (50, 90, 220), "Y": (40, 180, 70)}
+              "X": (50, 90, 220), "Y": (40, 180, 70),
+              "START": (120, 120, 130)}
 
-SIDEBAR_ITEMS = ["Home", "Search", "Favorites", "History"]
+# Claves internas de las secciones. Lo que se pinta se traduce con T().
+SIDEBAR_ITEMS = ["Home", "Search", "Favorites", "History", "Settings"]
+
+# Idioma actual. En una lista para poder cambiarlo desde Settings sin tener
+# que pasar el estado por toda la UI. Por defecto ingles.
+LANG = ["en"]
+
+TEXTS = {
+    "en": {
+        "Home": "Home", "Search": "Search", "Favorites": "Favorites",
+        "History": "History", "Settings": "Settings",
+        "hb_play": "Play", "hb_quit": "Quit", "hb_search": "Search",
+        "hb_fav": "Fav", "hb_refresh": "Refresh", "hb_change": "Change",
+        "hb_apply": "Apply", "hb_back": "Back",
+        "loading_feed": "Loading feed...", "searching": "Searching...",
+        "updating_feed": "Updating feed...",
+        "no_results": "No results",
+        "no_favorites": "No favorites", "empty_history": "History is empty",
+        "no_wifi": "No WiFi - check the network and retry (X)",
+        "no_wifi_short": "No WiFi",
+        "no_video": "No connection or video unavailable",
+        "feed_kept": "Could not update - keeping saved feed",
+        "feed_fail": "No connection or no results - Home retries",
+        "ytdlp_updated": "yt-dlp updated to %s",
+        "no_image": "no image", "loading": "loading", "loading_more": "loading more",
+        "error": "Error: %s",
+        "exit_q": "Are you sure you want to exit?",
+        "yes": "Yes", "no": "No",
+        "set_lang": "Language", "set_quality": "Video quality",
+        "set_aspect": "Video fit", "set_clear_cache": "Clear cache",
+        "set_clear_cookies": "Delete cookies.txt",
+        "set_action": "press A",
+        "cache_q": "Delete thumbnails and saved feed?",
+        "cookies_q": "Delete cookies.txt? The feed stops being personalized.",
+        "cache_done": "Cache cleared (%d files)",
+        "cookies_done": "cookies.txt deleted",
+        "cookies_none": "There was no cookies.txt",
+        "panel_max": "max %dp",
+        "osd_hint": "A: pause   Y: fit   B: exit",
+        "osd_play": "Play", "osd_pause": "Pause",
+        "aspect_fit": "Fit", "aspect_fit_hint": "black bars, nothing cropped",
+        "aspect_fill": "Fill", "aspect_fill_hint": "no bars, crops the sides",
+        "aspect_stretch": "Stretch", "aspect_stretch_hint": "no bars, distorted",
+    },
+    "es": {
+        "Home": "Inicio", "Search": "Buscar", "Favorites": "Favoritos",
+        "History": "Historial", "Settings": "Ajustes",
+        "hb_play": "Ver", "hb_quit": "Salir", "hb_search": "Buscar",
+        "hb_fav": "Favorito", "hb_refresh": "Recargar", "hb_change": "Cambiar",
+        "hb_apply": "Aplicar", "hb_back": "Atras",
+        "loading_feed": "Cargando feed...", "searching": "Buscando...",
+        "updating_feed": "Actualizando feed...",
+        "no_results": "Sin resultados",
+        "no_favorites": "Sin favoritos", "empty_history": "Historial vacio",
+        "no_wifi": "Sin conexion WiFi - revisa la red y reintenta (X)",
+        "no_wifi_short": "Sin conexion WiFi",
+        "no_video": "Sin conexion o video no disponible",
+        "feed_kept": "No se pudo actualizar - se mantiene el feed guardado",
+        "feed_fail": "Sin conexion o sin resultados - Home reintenta",
+        "ytdlp_updated": "yt-dlp actualizado a %s",
+        "no_image": "sin imagen", "loading": "cargando",
+        "loading_more": "cargando mas",
+        "error": "Error: %s",
+        "exit_q": "Seguro que quieres salir?",
+        "yes": "Si", "no": "No",
+        "set_lang": "Idioma", "set_quality": "Calidad de video",
+        "set_aspect": "Encaje del video", "set_clear_cache": "Borrar cache",
+        "set_clear_cookies": "Borrar cookies.txt",
+        "set_action": "pulsa A",
+        "cache_q": "Borrar miniaturas y feed guardado?",
+        "cookies_q": "Borrar cookies.txt? El feed dejara de ser personalizado.",
+        "cache_done": "Cache borrada (%d ficheros)",
+        "cookies_done": "cookies.txt borrado",
+        "cookies_none": "No habia cookies.txt",
+        "panel_max": "maximo %dp",
+        "osd_hint": "A: pausa   Y: encaje   B: salir",
+        "osd_play": "Play", "osd_pause": "Pausa",
+        "aspect_fit": "Ajustar", "aspect_fit_hint": "barras negras, se ve todo",
+        "aspect_fill": "Llenar", "aspect_fill_hint": "sin barras, recorta los lados",
+        "aspect_stretch": "Estirar", "aspect_stretch_hint": "sin barras, imagen deformada",
+    },
+}
+
+
+def T(key):
+    """Texto en el idioma activo, con el ingles como respaldo."""
+    return TEXTS.get(LANG[0], TEXTS["en"]).get(key, TEXTS["en"].get(key, key))
+
 
 DL_TEXTS = {
     "en": {
@@ -341,6 +629,11 @@ class ThumbLoader(object):
 
 class App(object):
     def __init__(self):
+        # El idioma se lee antes de tocar la UI: todo lo que se pinta pasa
+        # por T(). Ingles por defecto.
+        LANG[0] = CFG.get("lang", "en")
+        if LANG[0] not in TEXTS:
+            LANG[0] = "en"
         sdl2.SDL_SetHint(b"SDL_RENDER_SCALE_QUALITY", b"1")
         sdl2.SDL_Init(sdl2.SDL_INIT_VIDEO | sdl2.SDL_INIT_GAMECONTROLLER)
         ttf.TTF_Init()
@@ -353,19 +646,22 @@ class App(object):
 
         self.sidebar_idx = 0
         self.in_sidebar = True     # foco inicial en Home (es lo que carga)
+        self.settings_idx = 0      # opcion elegida en Ajustes
         self.grid_idx = 0
         self.scroll_row = 0
         self.videos = []
-        self.status = "Cargando feed..."
+        self.status = T("loading_feed")
         self.cookie_warn = False
         self.cookie_popup = None   # 'missing' | 'expired' -> muestra ventana
-        self.cookie_lang = "en"
+        self.cookie_lang = LANG[0]
         self.modal = None          # (pregunta, [opciones], idx, callback)
         self.running = True
         self.section = "Home"
         self.search_token = None      # continuacion de busqueda innertube
         self.feed_offset = 0          # paginacion del home
         self.loading_more = False
+        self.refreshing = False       # START: refresco del feed en curso
+        self.aspect = self._load_aspect()   # modo de encaje del video
         self.favorites = self._load_json("favorites.json")
         self.history = self._load_json("history.json")
 
@@ -376,7 +672,7 @@ class App(object):
             def upd():
                 v = backend.update_ytdlp_if_needed()
                 if v:
-                    self.status = "yt-dlp actualizado a %s" % v
+                    self.status = T("ytdlp_updated") % v
             threading.Thread(target=upd, daemon=True).start()
 
         # Precalentar el motor de yt-dlp mientras el usuario mira el feed.
@@ -391,7 +687,10 @@ class App(object):
         if _which_player()[0] is None:
             self._install_mpv()
 
-        threading.Thread(target=self._load_home, daemon=True).start()
+        # El feed arranca desde el cache: instantaneo y sin red. Para traer
+        # novedades esta START.
+        threading.Thread(target=self._load_home, kwargs={"refresh": False},
+                         daemon=True).start()
 
     # ---------- descarga automatica de yt-dlp ----------
     def _download_ytdlp(self):
@@ -507,25 +806,75 @@ class App(object):
         with open(os.path.join(BASE, name), "w") as f:
             json.dump(data, f)
 
-    def _load_home(self):
-        # 1) mostrar el ultimo feed cacheado al instante
+    def _load_home(self, refresh=True):
+        """Carga el feed de inicio.
+
+        Con refresh=False se queda con el cache si existe y NO toca la red:
+        el feed remoto tarda ~45 s en esta consola y sustituir la lista a
+        medias hacia perder la posicion y recargar todas las miniaturas.
+        El refresco va aparte, con START."""
         cached = self._load_json("feed_cache.json")
         if cached:
             self.videos = cached
             self.status = ""
             self._prefetch(cached)
-        # 2) refrescar en segundo plano
+            if not refresh:
+                self._fill_channels(cached)
+                return
+        # refrescar contra la red
         vids, cookie_state = backend.home_feed(CFG["search_count"] * 2)
         if vids:
             self.videos = vids
             self.status = ""
+            self.grid_idx = 0
+            self.scroll_row = 0
+            self.feed_offset = 0
             self._save_json("feed_cache.json", vids)
             self._prefetch(vids)
         elif not cached:
-            self.status = "Sin conexion o sin resultados - Home reintenta"
+            self.status = T("feed_fail")
+        else:
+            self.status = T("feed_kept")
         if cookie_state != "ok":
             self.cookie_popup = cookie_state
         self._fill_channels(self.videos)
+
+    def _refresh_home(self):
+        """START: recarga el feed contra la red.
+
+        Bloquea con un cartel mientras dura: son ~10 s en los que la lista
+        vieja sigue en pantalla, y sin aviso parece que el boton no hizo
+        nada (o peor, invita a pulsarlo otra vez)."""
+        if self.section != "Home" or self.refreshing:
+            return
+        self.refreshing = True
+        self.status = T("updating_feed")
+        done = [False]
+
+        def worker():
+            try:
+                self._load_home(refresh=True)
+            except backend.NetworkError:
+                self.status = T("no_wifi_short")
+            except Exception as e:               # noqa: BLE001
+                self.status = T("error") % e
+            finally:
+                self.refreshing = False
+                done[0] = True
+        threading.Thread(target=worker, daemon=True).start()
+
+        ev = sdl2.SDL_Event()
+        frame = 0
+        while not done[0] and self.running:
+            while sdl2.SDL_PollEvent(ctypes.byref(ev)):
+                if ev.type == sdl2.SDL_QUIT:
+                    self.running = False
+            self._draw_frame()
+            self._fill(UX, UY, UW, UH, (0, 0, 0), 120)
+            self._draw_loading(T("updating_feed").rstrip("."), frame)
+            sdl2.SDL_RenderPresent(self.ren)
+            frame += 1
+            sdl2.SDL_Delay(100)
 
     def _prefetch(self, vids):
         # solo las 2 filas visibles (4 thumbnails); el resto se pide al hacer scroll
@@ -562,7 +911,7 @@ class App(object):
                         self.videos = vids + more
                         self._fill_channels(more)
                 except backend.NetworkError:
-                    self.status = "Sin conexion WiFi"
+                    self.status = T("no_wifi_short")
                 finally:
                     self.loading_more = False
             threading.Thread(target=worker, daemon=True).start()
@@ -579,13 +928,13 @@ class App(object):
                         self.videos = vids + more
                         self.search_token = nxt
                 except backend.NetworkError:
-                    self.status = "Sin conexion WiFi"
+                    self.status = T("no_wifi_short")
                 finally:
                     self.loading_more = False
             threading.Thread(target=worker2, daemon=True).start()
 
     def _do_search(self, query):
-        self.status = "Buscando..."
+        self.status = T("searching")
         self.videos = []
         self.grid_idx = 0
         self.scroll_row = 0
@@ -594,12 +943,12 @@ class App(object):
             try:
                 self.videos, self.search_token = backend.search(
                     query, CFG["search_count"] * 2)
-                self.status = "" if self.videos else "Sin resultados"
+                self.status = "" if self.videos else T("no_results")
                 self._prefetch(self.videos)
             except backend.NetworkError:
-                self.status = "Sin conexion WiFi - revisa la red y reintenta (X)"
+                self.status = T("no_wifi")
             except Exception as e:
-                self.status = "Error: %s" % e
+                self.status = T("error") % e
         threading.Thread(target=worker, daemon=True).start()
 
     # ---------- playback ----------
@@ -687,7 +1036,7 @@ class App(object):
             sdl2.SDL_Delay(80)
         url = result.get("url")
         if not url:
-            self.status = "Sin conexion o video no disponible"
+            self.status = T("no_video")
             return
         name, path = _which_player()
         if not name:
@@ -703,23 +1052,42 @@ class App(object):
         self._save_json("history.json", self.history[:100])
         self._close_display()
         try:
-            proc = subprocess.Popen(
-                _player_cmd(name, path, url, result.get("audio")),
-                env=_player_env())
-            # B = salir del video (mismo boton que atras en la app).
-            was_down = True   # ignorar si B sigue pulsado al entrar
+            try:
+                os.remove(MPV_SOCKET)      # restos de una sesion anterior
+            except OSError:
+                pass
+            cmdline = _player_cmd(name, path, url, result.get("audio"),
+                                  self.aspect)
+            _vlog("lanzando: %s" % " ".join(
+                a for a in cmdline if a.startswith("--") or a == path))
+            proc = subprocess.Popen(cmdline, env=_player_env())
+            # Durante el video:  B = salir   A = pausa/continuar
+            #                    Y = rotar el modo de encaje
+            # Se ignora el estado inicial de cada boton para que el mismo
+            # pulsado con el que se entro al video no cuente como evento.
+            was = {"A": True, "B": True, "Y": True}
+            btns = {"A": sdl2.SDL_CONTROLLER_BUTTON_A,
+                    "B": sdl2.SDL_CONTROLLER_BUTTON_B,
+                    "Y": sdl2.SDL_CONTROLLER_BUTTON_Y}
             while proc.poll() is None:
                 sdl2.SDL_GameControllerUpdate()
-                down = bool(self.pad and sdl2.SDL_GameControllerGetButton(
-                    self.pad, sdl2.SDL_CONTROLLER_BUTTON_B))
-                if down and not was_down:
+                now = dict((k, bool(self.pad and
+                                    sdl2.SDL_GameControllerGetButton(self.pad, v)))
+                           for k, v in btns.items())
+                if now["B"] and not was["B"]:
                     proc.terminate()
                     try:
                         proc.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         proc.kill()
                     break
-                was_down = down
+                if now["A"] and not was["A"]:
+                    _vlog("A -> pausa/continuar")
+                    self._toggle_pause()
+                if now["Y"] and not was["Y"]:
+                    _vlog("Y -> cambio de encaje")
+                    self._cycle_aspect()
+                was = now
                 sdl2.SDL_Delay(50)
         finally:
             # esperar a que se suelte B para que no llegue a la UI
@@ -734,6 +1102,55 @@ class App(object):
             ev = sdl2.SDL_Event()
             while sdl2.SDL_PollEvent(ctypes.byref(ev)):
                 pass
+
+    def _toggle_pause(self):
+        """A durante el video: pausa o continua."""
+        paused = _mpv_query(["pause"]).get("pause")
+        ok = _mpv_ipc(_osd_setup_ipc() +
+                      [["cycle", "pause"],
+                       ["show-text",
+                        T("osd_play") if paused else T("osd_pause"), 900]])
+        _vlog("  pausa: estado previo=%r  ipc_ok=%s  ahora=%r"
+              % (paused, ok, _mpv_query(["pause"]).get("pause")))
+
+    def _cycle_aspect(self):
+        """Y durante el video: pasa al siguiente modo de encaje.
+
+        Se aplica en caliente por el socket IPC de mpv (sin reiniciar la
+        reproduccion), avisa en pantalla y se recuerda para los siguientes
+        videos."""
+        self.aspect = (self.aspect + 1) % len(ASPECT_MODES)
+        name_key, hint_key, _ = ASPECT_MODES[self.aspect]
+        name, hint = T(name_key), T(hint_key)
+        vp = _mpv_query(["width", "height"])
+        ratio = _ratio_text(vp.get("width"), vp.get("height"))
+        text = "%d/%d  %s\n%s" % (self.aspect + 1, len(ASPECT_MODES),
+                                  name, hint)
+        if ratio:
+            text += "\n" + ratio
+        cmds = _osd_setup_ipc() + list(ASPECT_IPC[self.aspect])
+        cmds.append(["show-text", text, ASPECT_OSD_MS])
+        ok = _mpv_ipc(cmds)
+        _vlog("  encaje -> %s  ipc_ok=%s  panscan=%r keepaspect=%r"
+              % (name, ok, _mpv_query(["panscan"]).get("panscan"),
+                 _mpv_query(["keepaspect"]).get("keepaspect")))
+        if ok:
+            self._save_aspect()
+
+    def _save_aspect(self):
+        try:
+            with open(os.path.join(BASE, "aspect.json"), "w") as f:
+                json.dump({"aspect": self.aspect}, f)
+        except OSError:
+            pass
+
+    def _load_aspect(self):
+        try:
+            with open(os.path.join(BASE, "aspect.json")) as f:
+                v = int(json.load(f).get("aspect", 0))
+                return v % len(ASPECT_MODES)
+        except (OSError, ValueError, TypeError):
+            return 0
 
     # ---------- input ----------
     BTN = {sdl2.SDL_CONTROLLER_BUTTON_A: "A", sdl2.SDL_CONTROLLER_BUTTON_B: "B",
@@ -755,16 +1172,26 @@ class App(object):
             self._handle_modal(btn)
             return
         if btn == "B":            # B = atras/salir
-            self._confirm_exit()
+            # En Ajustes, B vuelve a la barra lateral en vez de salir de la
+            # app: pedir confirmacion de salida ahi seria desconcertante.
+            if self.section == "Settings" and not self.in_sidebar:
+                self.in_sidebar = True
+            else:
+                self._confirm_exit()
         elif btn == "A":          # A = seleccionar/reproducir
             if self.in_sidebar:
                 self._enter_section()
+            elif self.section == "Settings":
+                self._settings_activate()
             elif self.videos:
                 self.play(self.videos[self.grid_idx])
         elif btn == "Y":
-            self._toggle_fav()
+            if self.section != "Settings":
+                self._toggle_fav()
         elif btn == "X":
             self._enter_search()
+        elif btn == "START":
+            self._refresh_home()
         elif btn in ("UP", "DOWN", "LEFT", "RIGHT"):
             self._navigate(btn)
 
@@ -776,6 +1203,17 @@ class App(object):
                 self.sidebar_idx = min(len(SIDEBAR_ITEMS) - 1, self.sidebar_idx + 1)
             elif btn == "RIGHT":
                 self.in_sidebar = False
+            return
+        if self.section == "Settings":
+            n = len(self._settings_items())
+            if btn == "UP":
+                self.settings_idx = (self.settings_idx - 1) % n
+            elif btn == "DOWN":
+                self.settings_idx = (self.settings_idx + 1) % n
+            elif btn == "LEFT":
+                self._settings_change(-1)
+            elif btn == "RIGHT":
+                self._settings_change(1)
             return
         n = len(self.videos)
         if not n:
@@ -806,22 +1244,120 @@ class App(object):
         elif row > self.scroll_row + 1:
             self.scroll_row = row - 1
 
+    # ---------- ajustes ----------
+    def _quality_options(self):
+        """Resoluciones ofrecidas, topadas por la del panel.
+
+        No tiene sentido pedir 720p en una pantalla de 480: solo gastaria CPU
+        decodificando pixeles que hay que tirar al escalar."""
+        _, panel_h = _screen_size()
+        return [q for q in (144, 240, 360, 480, 720) if q <= panel_h] or [360]
+
+    def _settings_items(self):
+        """Lista de (clave, etiqueta, valor_mostrado). Se recalcula al vuelo
+        para que refleje el idioma y los valores actuales."""
+        _, panel_h = _screen_size()
+        langs = {"en": "English", "es": "Espanol"}
+        return [
+            ("lang", T("set_lang"), langs.get(LANG[0], LANG[0])),
+            ("quality", T("set_quality"),
+             "%dp   %s" % (CFG["quality"], T("panel_max") % panel_h)),
+            ("aspect", T("set_aspect"), T(ASPECT_MODES[self.aspect][0])),
+            ("cache", T("set_clear_cache"), T("set_action")),
+            ("cookies", T("set_clear_cookies"), T("set_action")),
+        ]
+
+    def _settings_change(self, delta):
+        """LEFT/RIGHT sobre una opcion con valores."""
+        key = self._settings_items()[self.settings_idx][0]
+        if key == "lang":
+            order = ["en", "es"]
+            LANG[0] = order[(order.index(LANG[0]) + delta) % len(order)]
+            self.cookie_lang = LANG[0]
+            self._save_config()
+        elif key == "quality":
+            opts = self._quality_options()
+            i = opts.index(CFG["quality"]) if CFG["quality"] in opts else 0
+            CFG["quality"] = opts[(i + delta) % len(opts)]
+            self._save_config()
+        elif key == "aspect":
+            self.aspect = (self.aspect + delta) % len(ASPECT_MODES)
+            self._save_aspect()
+
+    def _settings_activate(self):
+        """A sobre una opcion: acciones destructivas piden confirmacion."""
+        key = self._settings_items()[self.settings_idx][0]
+        if key == "cache":
+            self.modal = [T("cache_q"), [T("no"), T("yes")], 0,
+                          lambda ans: self._clear_cache()
+                          if ans == T("yes") else None]
+        elif key == "cookies":
+            self.modal = [T("cookies_q"), [T("no"), T("yes")], 0,
+                          lambda ans: self._clear_cookies()
+                          if ans == T("yes") else None]
+        else:
+            self._settings_change(1)
+
+    def _clear_cache(self):
+        """Borra miniaturas y feed guardado. No toca favoritos ni historial."""
+        n = 0
+        try:
+            for f in os.listdir(THUMB_DIR):
+                try:
+                    os.remove(os.path.join(THUMB_DIR, f))
+                    n += 1
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        for name in ("feed_cache.json",):
+            try:
+                os.remove(os.path.join(BASE, name))
+                n += 1
+            except OSError:
+                pass
+        self.thumbs.forget_textures()
+        self.thumbs.ready.clear()
+        self.thumbs.failed.clear()
+        self.status = T("cache_done") % n
+
+    def _clear_cookies(self):
+        try:
+            os.remove(backend.COOKIES)
+            self.status = T("cookies_done")
+        except OSError:
+            self.status = T("cookies_none")
+
+    def _save_config(self):
+        """Guarda idioma y calidad en config.json, conservando el resto."""
+        CFG["lang"] = LANG[0]
+        try:
+            with open(os.path.join(BASE, "config.json"), "w") as f:
+                json.dump(CFG, f, indent=2)
+        except OSError:
+            pass
+
     def _enter_section(self):
         self.section = SIDEBAR_ITEMS[self.sidebar_idx]
         self.in_sidebar = False
         self.grid_idx = 0
         self.scroll_row = 0
-        if self.section == "Home":
-            self.status = "Cargando feed..."
-            self.videos = []
+        if self.section == "Settings":
+            self.settings_idx = 0
+            self.status = ""
+        elif self.section == "Home":
+            # Volver a Home muestra el cache al instante; para traer
+            # novedades esta START.
+            self.status = T("loading_feed")
             self.feed_offset = 0
-            threading.Thread(target=self._load_home, daemon=True).start()
+            threading.Thread(target=self._load_home,
+                             kwargs={"refresh": False}, daemon=True).start()
         elif self.section == "Favorites":
             self.videos = list(self.favorites)
-            self.status = "" if self.videos else "Sin favoritos"
+            self.status = "" if self.videos else T("no_favorites")
         elif self.section == "History":
             self.videos = list(self.history)
-            self.status = "" if self.videos else "Historial vacio"
+            self.status = "" if self.videos else T("empty_history")
         elif self.section == "Search":
             self._enter_search()
 
@@ -840,8 +1376,8 @@ class App(object):
         self._save_json("favorites.json", self.favorites)
 
     def _confirm_exit(self):
-        self.modal = ["Are you sure you want to exit?", ["No", "Yes"], 0,
-                      lambda ans: setattr(self, "running", ans != "Yes")]
+        self.modal = [T("exit_q"), [T("no"), T("yes")], 0,
+                      lambda ans: setattr(self, "running", ans != T("yes"))]
 
     def _handle_modal(self, btn):
         q, opts, idx, cb = self.modal
@@ -995,12 +1531,17 @@ class App(object):
             sel = (i == self.sidebar_idx)
             if sel and self.in_sidebar:
                 self._fill_round(UX + 4, y - 4, sb_w - 8, 26, (50, 50, 50), rad=6)
-            self.text.draw(item, UX + 14, y, 13,
+            self.text.draw(T(item), UX + 14, y, 13,
                            C_TEXT if sel else C_DIM)
         # cabecera
         gx = UX + sb_w + 12
         gw = UW - sb_w - 12
-        self.text.draw(self.section, gx, UY, 20)
+        self.text.draw(T(self.section), gx, UY, 20)
+        if self.section == "Settings":
+            self._draw_settings(gx, gw)
+            self._draw_help_bar()
+            self._draw_overlays()
+            return
         # grid 2 columnas x 2 filas visibles
         cw = (gw - 12) // 2
         ch = (UH - 66) // 2
@@ -1022,11 +1563,11 @@ class App(object):
                 if not v.is_notice:
                     self.thumbs.request(v)
                     if v.id in self.thumbs.failed:
-                        self.text.draw("sin imagen", x + cw // 2 - 30,
+                        self.text.draw(T("no_image"), x + cw // 2 - 30,
                                        y + th // 2 - 8, 11, C_DIM)
                     else:
                         dots = "." * (1 + sdl2.SDL_GetTicks() // 400 % 3)
-                        self.text.draw("cargando" + dots, x + cw // 2 - 30,
+                        self.text.draw(T("loading") + dots, x + cw // 2 - 30,
                                        y + th // 2 - 8, 11, C_DIM)
             if v.duration:
                 dtxt = self._fmt_dur(v.duration)
@@ -1039,24 +1580,62 @@ class App(object):
         # indicador de "cargando mas" al fondo
         if self.loading_more:
             dots = "." * (1 + sdl2.SDL_GetTicks() // 300 % 3)
-            self.text.draw("cargando mas" + dots, gx + gw // 2 - 40,
+            self.text.draw(T("loading_more") + dots, gx + gw // 2 - 40,
                            UY + UH - 40, 12, (230, 200, 60))
         # status: cargas centradas con spinner, avisos abajo
         if self.status:
             if not self.videos and (self.status.startswith("Cargando")
-                                    or self.status.startswith("Buscando")):
+                                    or self.status.startswith("Loading")
+                                    or self.status.startswith("Buscando")
+                                    or self.status.startswith("Searching")):
                 self._draw_loading(self.status.rstrip("."),
                                    sdl2.SDL_GetTicks() // 300)
             else:
                 self.text.draw(self.status, gx, UY + UH - 40, 12, (230, 200, 60))
-        # help bar
+        self._draw_help_bar()
+        self._draw_overlays()
+
+    def _draw_settings(self, gx, gw):
+        """Lista de ajustes: etiqueta a la izquierda, valor a la derecha."""
+        y = UY + 40
+        for i, (key, label, value) in enumerate(self._settings_items()):
+            sel = (i == self.settings_idx and not self.in_sidebar)
+            if sel:
+                self._fill_round(gx - 6, y - 5, gw - 6, 30, (55, 58, 70), rad=6)
+            self.text.draw(label, gx, y, 14, C_TEXT if sel else C_DIM)
+            # Las acciones se pintan en ambar: no cambian un valor, ejecutan.
+            col = (230, 200, 60) if key in ("cache", "cookies") else C_TEXT
+            vw = self.text.tex(value, 12, col)
+            x = gx + gw - 18 - (vw[1] if vw else 0)
+            self.text.draw(value, x, y + 3, 12, col)
+            if sel and key not in ("cache", "cookies"):
+                self.text.draw("<", gx + gw - 12, y + 3, 12, C_SEL)
+            y += 34
+        if self.status:
+            self.text.draw(self.status, gx, UY + UH - 40, 12, (230, 200, 60))
+
+    def _draw_help_bar(self):
+        """Barra de ayuda. La anchura de cada pildora se calcula segun el
+        texto: "START" no cabia en los 16 px pensados para una sola letra."""
         hb_y = UY + UH - 20
         hx = UX
-        for btn, label in [("A", "Play"), ("B", "Quit"), ("X", "Search"), ("Y", "Fav")]:
-            self._fill_round(hx, hb_y, 16, 16, BTN_COLORS[btn], rad=8)
-            self.text.draw(btn, hx + 4, hb_y + 1, 11, (0, 0, 0))
-            w = self.text.draw(label, hx + 20, hb_y + 1, 11, C_TEXT)
-            hx += 20 + 8 + 60
+        if self.section == "Settings":
+            help_btns = [("A", T("hb_apply")), ("B", T("hb_back")),
+                         ("< >", T("hb_change"))]
+        else:
+            help_btns = [("A", T("hb_play")), ("B", T("hb_quit")),
+                         ("X", T("hb_search")), ("Y", T("hb_fav"))]
+            if self.section == "Home":
+                help_btns.append(("START", T("hb_refresh")))
+        for btn, label in help_btns:
+            w_btn = 16 if len(btn) == 1 else 10 + 7 * len(btn)
+            self._fill_round(hx, hb_y, w_btn, 16, BTN_COLORS.get(btn, C_DIM),
+                             rad=8)
+            self.text.draw(btn, hx + 5, hb_y + 1, 11, (0, 0, 0))
+            lw = self.text.draw(label, hx + w_btn + 4, hb_y + 1, 11, C_TEXT)
+            hx += w_btn + 8 + max(40, (lw or 0) + 10)
+
+    def _draw_overlays(self):
         # ventana de instrucciones de cookies
         if self.cookie_popup:
             mw, mh = 470, 250
@@ -1075,18 +1654,20 @@ class App(object):
         # modal
         if self.modal:
             q, opts, idx, _cb = self.modal
-            mw, mh = 380, 120
+            mw, mh = 420, 130
             mx0 = UX + (UW - mw) // 2
             my0 = UY + (UH - mh) // 2
             self._fill(UX, UY, UW, UH, (0, 0, 0), 130)
             self._fill_round(mx0, my0, mw, mh, C_MODAL, 250, rad=12)
-            self.text.draw(q, mx0 + 24, my0 + 20, 14)
+            self.text.draw(q, mx0 + 20, my0 + 18, 13, C_TEXT, max_w=mw - 40)
             for i, o in enumerate(opts):
-                bx = mx0 + 40 + i * 170
-                by = my0 + 64
+                bx = mx0 + 40 + i * 180
+                by = my0 + 70
                 sel = (i == idx)
-                self._fill_round(bx, by, 130, 32, C_SEL if sel else (90, 90, 100), rad=15)
-                self.text.draw(o, bx + 52, by + 8, 13)
+                self._fill_round(bx, by, 140, 32, C_SEL if sel else (90, 90, 100), rad=15)
+                ow = self.text.tex(o, 13, C_TEXT)
+                self.text.draw(o, bx + 70 - ((ow[1] if ow else 0) // 2),
+                               by + 8, 13)
 
     def _render(self):
         self._draw_frame()

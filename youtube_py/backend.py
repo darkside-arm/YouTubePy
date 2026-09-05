@@ -198,17 +198,37 @@ class _NullLogger(object):
         pass
 
 
+def _stream_opts(quality, hq=True):
+    """Opciones de resolucion de stream.
+
+    hq=True: formatos DASH, que es donde vive el 480p de verdad. Se exige
+    avc1 (H.264) porque es lo unico que esta CPU decodifica con holgura; vp9
+    y av1 a 480p no van. Video y audio vienen separados y el reproductor los
+    junta con --audio-file.
+
+    hq=False: respaldo con el cliente android, que entrega un progresivo
+    (itag 18, 640x360) ya firmado. Se usa cuando el camino DASH falla, p. ej.
+    en videos con restriccion de edad."""
+    if hq:
+        fmt = ("bv*[height<=%d][vcodec^=avc1]+ba[acodec^=mp4a]"
+               "/bv*[height<=%d][vcodec^=avc1]+ba"
+               "/b[height<=%d][ext=mp4]/18/b" % (quality, quality, quality))
+        return {"format": fmt, "noplaylist": True}
+    return {
+        "format": _stream_format(quality),
+        "noplaylist": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    }
+
+
 def warmup_ytdlp(quality=480):
     """Precarga el motor para que la primera reproduccion no pague el arranque.
 
     Pensado para lanzarse en un hilo al abrir la app. Devuelve True si el
     motor en proceso quedo listo."""
     with _YDL_LOCK:
-        return _get_ydl("stream:%d" % quality, {
-            "format": _stream_format(quality),
-            "noplaylist": True,
-            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-        }) is not None
+        return _get_ydl("stream:hq:%d" % quality,
+                        _stream_opts(quality, True)) is not None
 
 
 def ytdlp_inprocess():
@@ -321,20 +341,25 @@ def _stream_format(quality):
 def resolve_stream(video, quality=480):
     """URL(s) de stream. Sin cookies (PO token). Mixes ya normalizados en Video.
 
-    Devuelve (video_url, audio_url). audio_url es None cuando el formato es
-    progresivo (video+audio en el mismo stream), que es el caso habitual.
-    Con un formato DASH hay video y audio separados y hay que pasar los dos al
-    reproductor: quedarse solo con el primero daba reproduccion muda.
+    Devuelve (video_url, audio_url). Con DASH (el caso normal, que es donde
+    hay 480p real) vienen video y audio separados y hay que pasar los dos al
+    reproductor: quedarse solo con el primero da reproduccion muda.
 
-    Usa el motor en proceso si esta cargado (ahorra ~6 s por video); si no,
-    cae al subproceso de siempre."""
-    r = _resolve_inprocess(video, quality)
+    Tres intentos, de mejor a mas seguro:
+      1. DASH en proceso   -> 854x480 avc1 + audio m4a  (4-7 s)
+      2. progresivo android en proceso -> 640x360 itag 18, para videos que
+         el camino DASH rechaza (restriccion de edad, etc.)
+      3. subproceso, por si el motor en proceso no esta disponible."""
+    r = _resolve_inprocess(video, quality, hq=True)
     if r is not None:
         return r
-    fmt = _stream_format(quality)
+    r = _resolve_inprocess(video, quality, hq=False)
+    if r is not None:
+        return r
     cmd = _ytdlp_cmd() + [
-        "-f", fmt, "-g", "--no-warnings", "--no-check-certificates",
-        "--no-playlist", "--extractor-args", "youtube:player_client=android,web",
+        "-f", _stream_format(quality), "-g", "--no-warnings",
+        "--no-check-certificates", "--no-playlist",
+        "--extractor-args", "youtube:player_client=android,web",
         video.url]
     try:
         out = subprocess.run(cmd, stdout=subprocess.PIPE,
@@ -347,14 +372,11 @@ def resolve_stream(video, quality=480):
     return lines[0], (lines[1] if len(lines) > 1 else None)
 
 
-def _resolve_inprocess(video, quality):
+def _resolve_inprocess(video, quality, hq=True):
     """Resolucion con el modulo importado. None si no esta disponible."""
+    key = "stream:%s:%d" % ("hq" if hq else "lq", quality)
     with _YDL_LOCK:
-        ydl = _get_ydl("stream:%d" % quality, {
-            "format": _stream_format(quality),
-            "noplaylist": True,
-            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-        })
+        ydl = _get_ydl(key, _stream_opts(quality, hq))
         if ydl is None:
             return None
         try:
