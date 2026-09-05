@@ -13,16 +13,12 @@ name: Publicar release (yt-dlp aarch64 + codigo)
 # Ademas mantiene el tag movil "ytdlp-latest" con los mismos assets, para
 # tener una URL de descarga estable (es la que usa la app para bajar mpv).
 #
-# Lanzalo cuando cambies el codigo del port. Si no hay version nueva de
-# yt-dlp y quieres reempaquetar igualmente, marca la casilla "force".
+# Lanzalo cuando cambies el codigo del port. Al ser manual SIEMPRE construye
+# y republica, aunque yt-dlp no haya sacado version nueva: si el release ya
+# existe se borra y se vuelve a crear con el codigo actual.
 
 on:
   workflow_dispatch:
-    inputs:
-      force:
-        description: "Regenerar el release aunque no haya version nueva de yt-dlp"
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -43,24 +39,7 @@ jobs:
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "Upstream yt-dlp: $ver"
 
-      - name: Comprobar si ya publicamos esta version
-        id: have
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ "${{ inputs.force }}" = "true" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if gh release view "ytdlp-${{ steps.up.outputs.version }}" \
-               --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Ya existe el release, nada que hacer."
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Descargar y verificar yt-dlp (zipapp)
-        if: steps.have.outputs.skip == 'false'
         env:
           V: ${{ steps.up.outputs.version }}
         run: |
@@ -82,7 +61,6 @@ jobs:
                       print('zipapp ok:', yt_dlp.version.__version__)"
 
       - name: Construir dependencia mpv-aarch64.zip
-        if: steps.have.outputs.skip == 'false'
         run: |
           # Paquete de dependencia OPCIONAL, aparte del zip del port. La app
           # lo descarga sola cuando no encuentra mpv en el sistema, y lo
@@ -125,7 +103,6 @@ jobs:
           ls -l mpv-aarch64.zip && unzip -l mpv-aarch64.zip
 
       - name: Empaquetar codigo + yt-dlp
-        if: steps.have.outputs.skip == 'false'
         id: pack
         env:
           V: ${{ steps.up.outputs.version }}
@@ -151,7 +128,6 @@ jobs:
           unzip -l "$zipname" | tail -n 5
 
       - name: Publicar release ytdlp-<version>
-        if: steps.have.outputs.skip == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           V: ${{ steps.up.outputs.version }}
@@ -176,7 +152,6 @@ jobs:
             "$ZIP" mpv-aarch64.zip
 
       - name: Actualizar tag movil ytdlp-latest
-        if: steps.have.outputs.skip == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           V: ${{ steps.up.outputs.version }}
