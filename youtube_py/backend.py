@@ -5,6 +5,8 @@ import os
 import re
 import ssl
 import subprocess
+import sys
+import threading
 import urllib.error
 import urllib.request
 
@@ -12,6 +14,11 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 YTDLP = os.path.join(BASE, "yt-dlp.real")
 if not os.path.exists(YTDLP):
     YTDLP = "/roms/ports/youtube/yt-dlp.real"
+# Zipapp de yt-dlp (python puro, ~3 MB). Se prefiere al binario PyInstaller
+# de 36 MB porque se puede importar DENTRO de este proceso: el binario paga
+# ~6 s de arranque en CADA invocacion (descomprimir el archivo + levantar un
+# interprete), mientras que el zipapp se importa una sola vez al arrancar.
+YTDLP_ZIP = os.path.join(BASE, "yt-dlp.zip")
 COOKIES = os.path.join(BASE, "cookies.txt")
 if not os.path.exists(COOKIES):
     COOKIES = "/roms/ports/youtube/cookies.txt"
@@ -126,11 +133,101 @@ def _parse_search(data, limit):
     return vids, token
 
 
+# ---------- motor yt-dlp en proceso ----------
+# Importar el zipapp dentro de este proceso cuesta ~6 s una sola vez (se hace
+# en segundo plano al arrancar la app, tapado por la carga del feed) y ahorra
+# esos mismos ~6 s en CADA resolucion posterior.
+_YDL_LOCK = threading.Lock()
+_YDL_CACHE = {}          # clave -> instancia YoutubeDL
+_YDL_MODULE = [None]     # [modulo yt_dlp] o [False] si no se puede usar
+
+
+def _ytdlp_module():
+    """Importa yt_dlp desde el zipapp. Devuelve el modulo o None."""
+    if _YDL_MODULE[0] is not None:
+        return _YDL_MODULE[0] or None
+    # El zipapp oficial exige Python 3.9+; en imagenes mas viejas se usa el
+    # binario por subproceso.
+    if sys.version_info < (3, 9) or not os.path.exists(YTDLP_ZIP):
+        _YDL_MODULE[0] = False
+        return None
+    try:
+        if YTDLP_ZIP not in sys.path:
+            sys.path.insert(0, YTDLP_ZIP)
+        import yt_dlp                      # noqa: PLC0415
+        _YDL_MODULE[0] = yt_dlp
+        return yt_dlp
+    except Exception:                      # noqa: BLE001
+        _YDL_MODULE[0] = False
+        return None
+
+
+def _get_ydl(key, opts):
+    """Instancia YoutubeDL cacheada (construirla cuesta ~3 s)."""
+    ydl = _YDL_CACHE.get(key)
+    if ydl is not None:
+        return ydl
+    mod = _ytdlp_module()
+    if mod is None:
+        return None
+    base = {"quiet": True, "no_warnings": True, "nocheckcertificate": True,
+            "skip_download": True, "socket_timeout": 15,
+            "noprogress": True, "logger": _NullLogger()}
+    base.update(opts)
+    try:
+        ydl = mod.YoutubeDL(base)
+    except Exception:                      # noqa: BLE001
+        return None
+    _YDL_CACHE[key] = ydl
+    return ydl
+
+
+class _NullLogger(object):
+    """yt-dlp escribe por stdout/stderr; aqui eso ensucia log.txt."""
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        pass
+
+
+def warmup_ytdlp(quality=480):
+    """Precarga el motor para que la primera reproduccion no pague el arranque.
+
+    Pensado para lanzarse en un hilo al abrir la app. Devuelve True si el
+    motor en proceso quedo listo."""
+    with _YDL_LOCK:
+        return _get_ydl("stream:%d" % quality, {
+            "format": _stream_format(quality),
+            "noplaylist": True,
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        }) is not None
+
+
+def ytdlp_inprocess():
+    return bool(_YDL_MODULE[0])
+
+
+def _ytdlp_cmd():
+    """Prefijo de comando para invocar yt-dlp como subproceso."""
+    if os.path.exists(YTDLP_ZIP) and sys.version_info >= (3, 9):
+        return [sys.executable, YTDLP_ZIP]
+    return [YTDLP]
+
+
 def _ytdlp_flat(url_or_query, limit, use_cookies, offset=0):
-    cmd = [YTDLP, "--flat-playlist", "--dump-json", "--no-warnings",
-           "--ignore-errors", "--no-check-certificates",
-           "--playlist-items", "%d-%d" % (offset + 1, offset + limit),
-           "--socket-timeout", "15"]
+    cmd = _ytdlp_cmd() + [
+        "--flat-playlist", "--dump-json", "--no-warnings",
+        "--ignore-errors", "--no-check-certificates",
+        "--playlist-items", "%d-%d" % (offset + 1, offset + limit),
+        "--socket-timeout", "15"]
     if use_cookies and os.path.exists(COOKIES):
         cmd += ["--cookies", COOKIES]
     cmd.append(url_or_query)
@@ -172,19 +269,29 @@ def home_feed(limit=20, offset=0):
     return _ytdlp_flat("ytsearch%d:trending music" % limit, limit, False), "missing"
 
 
+def _stream_format(quality):
+    return ("best[height<=%d][ext=mp4]/best[height<=%d][acodec!=none][vcodec!=none]"
+            "/18/22/best[height<=%d]/best" % (quality, quality, quality))
+
+
 def resolve_stream(video, quality=480):
     """URL(s) de stream. Sin cookies (PO token). Mixes ya normalizados en Video.
 
     Devuelve (video_url, audio_url). audio_url es None cuando el formato es
     progresivo (video+audio en el mismo stream), que es el caso habitual.
-    Si yt-dlp cae en un formato DASH, `-g` imprime dos lineas (video y audio
-    por separado) y hay que pasarle las dos al reproductor: quedarse solo con
-    la primera daba reproduccion muda."""
-    fmt = ("best[height<=%d][ext=mp4]/best[height<=%d][acodec!=none][vcodec!=none]"
-           "/18/22/best[height<=%d]/best" % (quality, quality, quality))
-    cmd = [YTDLP, "-f", fmt, "-g", "--no-warnings", "--no-check-certificates",
-           "--no-playlist", "--extractor-args", "youtube:player_client=android,web",
-           video.url]
+    Con un formato DASH hay video y audio separados y hay que pasar los dos al
+    reproductor: quedarse solo con el primero daba reproduccion muda.
+
+    Usa el motor en proceso si esta cargado (ahorra ~6 s por video); si no,
+    cae al subproceso de siempre."""
+    r = _resolve_inprocess(video, quality)
+    if r is not None:
+        return r
+    fmt = _stream_format(quality)
+    cmd = _ytdlp_cmd() + [
+        "-f", fmt, "-g", "--no-warnings", "--no-check-certificates",
+        "--no-playlist", "--extractor-args", "youtube:player_client=android,web",
+        video.url]
     try:
         out = subprocess.run(cmd, stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, timeout=60).stdout
@@ -194,6 +301,37 @@ def resolve_stream(video, quality=480):
     if not lines:
         return None, None
     return lines[0], (lines[1] if len(lines) > 1 else None)
+
+
+def _resolve_inprocess(video, quality):
+    """Resolucion con el modulo importado. None si no esta disponible."""
+    with _YDL_LOCK:
+        ydl = _get_ydl("stream:%d" % quality, {
+            "format": _stream_format(quality),
+            "noplaylist": True,
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        })
+        if ydl is None:
+            return None
+        try:
+            info = ydl.extract_info(video.url, download=False)
+        except Exception:                  # noqa: BLE001
+            return None
+    if not info:
+        return None
+    # DASH: yt-dlp deja los dos formatos elegidos en requested_formats.
+    req = info.get("requested_formats")
+    if req:
+        vurl = aurl = None
+        for f in req:
+            if f.get("vcodec") not in (None, "none") and not vurl:
+                vurl = f.get("url")
+            elif not aurl:
+                aurl = f.get("url")
+        if vurl:
+            return vurl, aurl
+    url = info.get("url")
+    return (url, None) if url else None
 
 
 def channel_of(video_id):
@@ -210,11 +348,17 @@ def channel_of(video_id):
 # Descarga directa desde el repo oficial de yt-dlp.
 YTDLP_BASE = "https://github.com/yt-dlp/yt-dlp/releases/latest/download"
 YTDLP_URL = YTDLP_BASE + "/yt-dlp_linux_aarch64"
+YTDLP_ZIP_URL = YTDLP_BASE + "/yt-dlp"      # zipapp python puro (~3 MB)
 YTDLP_SUMS_URL = YTDLP_BASE + "/SHA2-256SUMS"
 
 
+def _use_zipapp():
+    """El zipapp necesita Python 3.9+; si no, toca el binario de 36 MB."""
+    return sys.version_info >= (3, 9)
+
+
 def ytdlp_present():
-    return os.path.exists(YTDLP)
+    return os.path.exists(YTDLP_ZIP) or os.path.exists(YTDLP)
 
 
 def _curl_text(url, timeout=15):
@@ -244,10 +388,11 @@ def _sha256_file(path):
     return h.hexdigest()
 
 
-def _fetch_binary(url, part, expect_sha=None, progress_cb=None, resume=False):
+def _fetch_binary(url, part, expect_sha=None, progress_cb=None, resume=False,
+                  minsize=10 * 1024 * 1024):
     """Un intento de descarga a `part`. True si quedo integro."""
     import time
-    est_total = 38 * 1024 * 1024   # estimacion si no hay Content-Length
+    est_total = max(minsize, 1) * 11 // 10   # estimacion sin Content-Length
     cmd = ["curl", "-sS", "-L", "--insecure", "--max-time", "600",
            "--connect-timeout", "15", "--retry", "3", "--retry-delay", "2",
            "--speed-time", "45", "--speed-limit", "1024"]
@@ -266,7 +411,7 @@ def _fetch_binary(url, part, expect_sha=None, progress_cb=None, resume=False):
     if proc.returncode != 0:
         return False
     try:
-        if os.path.getsize(part) < 10 * 1024 * 1024:
+        if os.path.getsize(part) < minsize:
             return False
     except OSError:
         return False
@@ -279,8 +424,8 @@ def _fetch_binary(url, part, expect_sha=None, progress_cb=None, resume=False):
     return True
 
 
-def _upstream_sha256():
-    """SHA-256 oficial de yt-dlp_linux_aarch64 segun SHA2-256SUMS."""
+def _upstream_sha256(name="yt-dlp_linux_aarch64"):
+    """SHA-256 oficial de un asset de yt-dlp segun SHA2-256SUMS."""
     body = _curl_text(YTDLP_SUMS_URL, timeout=20)
     if not body:
         return None
@@ -293,16 +438,23 @@ def _upstream_sha256():
 
 
 def download_ytdlp(progress_cb=None):
-    """Descarga yt-dlp (~36 MB) a BASE/yt-dlp.real con progreso 0-100.
+    """Descarga yt-dlp del repo oficial con progreso 0-100.
 
-    Origen: repo oficial de yt-dlp. Verifica el SHA-256 contra el
-    SHA2-256SUMS publicado y reintenta reanudando descargas cortadas.
+    Con Python 3.9+ baja el zipapp (~3 MB) a BASE/yt-dlp.zip, que ademas se
+    puede importar en proceso; en Python mas viejo, el binario PyInstaller
+    (~36 MB) a BASE/yt-dlp.real. Verifica el SHA-256 contra el SHA2-256SUMS
+    publicado y reintenta reanudando descargas cortadas.
     Lanza NetworkError si todos los intentos fallan."""
     global YTDLP
-    dest = os.path.join(BASE, "yt-dlp.real")
+    zipapp = _use_zipapp()
+    if zipapp:
+        dest, url, name, minsize = YTDLP_ZIP, YTDLP_ZIP_URL, "yt-dlp", 1000000
+    else:
+        dest = os.path.join(BASE, "yt-dlp.real")
+        url, name, minsize = YTDLP_URL, "yt-dlp_linux_aarch64", 10000000
     part = dest + ".part"
 
-    sha = _upstream_sha256()
+    sha = _upstream_sha256(name)
 
     # (sha esperado, reanudar) en orden de preferencia
     attempts = [
@@ -317,12 +469,15 @@ def download_ytdlp(progress_cb=None):
                 os.remove(part)
             except OSError:
                 pass
-        if _fetch_binary(YTDLP_URL, part, expect, progress_cb, resume):
+        if _fetch_binary(url, part, expect, progress_cb, resume, minsize):
             if progress_cb:
                 progress_cb(100)
             os.replace(part, dest)
             os.chmod(dest, 0o755)
-            YTDLP = dest
+            if not zipapp:
+                YTDLP = dest
+            _YDL_MODULE[0] = None      # reintentar el import con el nuevo zip
+            _YDL_CACHE.clear()
             return True
 
     try:
@@ -435,9 +590,17 @@ def latest_ytdlp_version():
 
 
 def current_ytdlp_version():
+    # Si el modulo ya esta importado, la version se lee sin lanzar procesos.
+    mod = _YDL_MODULE[0]
+    if mod:
+        try:
+            return mod.version.__version__
+        except AttributeError:
+            pass
     try:
-        out = subprocess.run([YTDLP, "--version"], stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, timeout=30).stdout
+        out = subprocess.run(_ytdlp_cmd() + ["--version"],
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=60).stdout
         return out.decode().strip() or None
     except (subprocess.TimeoutExpired, OSError):
         return None

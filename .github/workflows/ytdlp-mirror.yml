@@ -1,22 +1,26 @@
-name: Release diario (yt-dlp aarch64 + codigo)
+name: Publicar release (yt-dlp aarch64 + codigo)
 
-# Una vez al dia comprueba si yt-dlp publico una version nueva para ARM64.
-# Si la hay (o si se lanza a mano), genera un release de este repo con un
-# unico asset:
-#   - YouTubePy-<ver>.zip   codigo completo + yt-dlp_linux_aarch64 ya puesto
-#                           en youtube_py/yt-dlp.real (verificado por SHA-256),
-#                           listo para descomprimir en /roms/ports
-# Ademas mantiene el tag movil "ytdlp-latest" con el mismo zip, para tener
-# una URL de descarga estable.
-# La app NO usa estos releases para actualizarse: baja yt-dlp del repo oficial.
+# Se lanza A MANO desde la pestana Actions. No hay cron: la app actualiza
+# yt-dlp sola contra el repo oficial en cada arranque, asi que estos releases
+# solo sirven para INSTALAR, no para mantener actualizado nada.
+#
+# Genera un release con:
+#   - YouTubePy-<ver>.zip   codigo completo + el zipapp de yt-dlp (~3 MB) ya
+#                           puesto en youtube_py/yt-dlp.zip (verificado por
+#                           SHA-256), listo para descomprimir en /roms/ports
+#   - mpv-aarch64.zip       dependencia OPCIONAL; la app se la descarga sola
+#                           si la consola no trae reproductor
+# Ademas mantiene el tag movil "ytdlp-latest" con los mismos assets, para
+# tener una URL de descarga estable (es la que usa la app para bajar mpv).
+#
+# Lanzalo cuando cambies el codigo del port. Si no hay version nueva de
+# yt-dlp y quieres reempaquetar igualmente, marca la casilla "force".
 
 on:
-  schedule:
-    - cron: "17 5 * * *"   # 05:17 UTC todos los dias
   workflow_dispatch:
     inputs:
       force:
-        description: "Regenerar el release aunque no haya version nueva"
+        description: "Regenerar el release aunque no haya version nueva de yt-dlp"
         type: boolean
         default: false
 
@@ -55,21 +59,27 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Descargar y verificar binario ARM64
+      - name: Descargar y verificar yt-dlp (zipapp)
         if: steps.have.outputs.skip == 'false'
         env:
           V: ${{ steps.up.outputs.version }}
         run: |
+          # Se empaqueta el ZIPAPP (python puro, ~3 MB), no el binario
+          # PyInstaller de 36 MB: la consola ya tiene Python 3, el zipapp se
+          # importa DENTRO del proceso de la app y evita pagar ~6 s de
+          # arranque de interprete en cada llamada a yt-dlp.
           base="https://github.com/yt-dlp/yt-dlp/releases/download/$V"
-          curl -fsSL --retry 5 --retry-delay 5 -o yt-dlp_linux_aarch64 \
-               "$base/yt-dlp_linux_aarch64"
+          curl -fsSL --retry 5 --retry-delay 5 -o yt-dlp "$base/yt-dlp"
           curl -fsSL --retry 5 --retry-delay 5 -o SHA2-256SUMS \
                "$base/SHA2-256SUMS"
-          grep " yt-dlp_linux_aarch64$" SHA2-256SUMS > expected.sha256
+          grep " yt-dlp$" SHA2-256SUMS > expected.sha256
           sha256sum -c expected.sha256
-          [ "$(stat -c%s yt-dlp_linux_aarch64)" -ge 10000000 ] \
-            || { echo "binario demasiado pequeno"; exit 1; }
-          file yt-dlp_linux_aarch64 | grep -qi 'aarch64'
+          [ "$(stat -c%s yt-dlp)" -ge 1000000 ] \
+            || { echo "zipapp demasiado pequeno"; exit 1; }
+          # Un zipapp es un ZIP con cabecera shebang: debe traer __main__.py
+          unzip -l yt-dlp | grep -q '__main__.py'
+          python3 -c "import sys; sys.path.insert(0,'yt-dlp'); import yt_dlp; \
+                      print('zipapp ok:', yt_dlp.version.__version__)"
 
       - name: Construir dependencia mpv-aarch64.zip
         if: steps.have.outputs.skip == 'false'
@@ -114,7 +124,7 @@ jobs:
           (cd mpvpkg && zip -rq ../mpv-aarch64.zip .)
           ls -l mpv-aarch64.zip && unzip -l mpv-aarch64.zip
 
-      - name: Empaquetar codigo + binario
+      - name: Empaquetar codigo + yt-dlp
         if: steps.have.outputs.skip == 'false'
         id: pack
         env:
@@ -125,17 +135,19 @@ jobs:
           # Codigo de la app tal cual va en /roms/ports/youtube_py
           cp -r youtube_py/. pkg/youtube_py/
           cp YouTubePy.sh pkg/
-          # Binario ya listo dentro del paquete: no hay descarga en el device
-          cp yt-dlp_linux_aarch64 pkg/youtube_py/yt-dlp.real
-          chmod 755 pkg/youtube_py/yt-dlp.real pkg/YouTubePy.sh
+          # yt-dlp ya listo dentro del paquete: no hay descarga en el device
+          cp yt-dlp pkg/youtube_py/yt-dlp.zip
+          chmod 755 pkg/youtube_py/yt-dlp.zip pkg/YouTubePy.sh
           # Limpieza de restos que no deben viajar
           find pkg -name '__pycache__' -type d -prune -exec rm -rf {} +
           find pkg -name '*.pyc' -delete
           rm -rf pkg/youtube_py/bin pkg/youtube_py/lib
           rm -f pkg/youtube_py/log.txt pkg/youtube_py/cookies.txt \
-                pkg/youtube_py/yt-dlp.real.part
+                pkg/youtube_py/yt-dlp.real pkg/youtube_py/yt-dlp.real.part \
+                pkg/youtube_py/yt-dlp.zip.part
           (cd pkg && zip -rq "../$zipname" .)
           echo "zip=$zipname" >> "$GITHUB_OUTPUT"
+          ls -l "$zipname"
           unzip -l "$zipname" | tail -n 5
 
       - name: Publicar release ytdlp-<version>
@@ -150,11 +162,15 @@ jobs:
           gh release create "ytdlp-$V" \
             --repo "${{ github.repository }}" \
             --title "YouTubePy - yt-dlp $V (linux aarch64)" \
-            --notes "Build automatico con yt-dlp **$V** para ARM64 (R36S/R36T/ArkOS).
+            --notes "Build con yt-dlp **$V** para ARM64 (R36S/R36T/ArkOS).
 
           **Instalacion:** descomprimir \`$ZIP\` dentro de \`/roms/ports\`
-          (deja \`YouTubePy.sh\` y la carpeta \`youtube_py/\` con el binario
-          ya incluido en \`youtube_py/yt-dlp.real\`, verificado por SHA-256).
+          (deja \`YouTubePy.sh\` y la carpeta \`youtube_py/\` con yt-dlp ya
+          incluido en \`youtube_py/yt-dlp.zip\`, verificado por SHA-256).
+
+          Se empaqueta el **zipapp** de yt-dlp (~3 MB) en vez del binario
+          PyInstaller (~36 MB): la app lo importa en su propio proceso y se
+          ahorra ~6 s de arranque de interprete en cada video.
 
           Upstream: https://github.com/yt-dlp/yt-dlp/releases/tag/$V" \
             "$ZIP" mpv-aarch64.zip
@@ -175,7 +191,7 @@ jobs:
             --notes "Apunta siempre a la ultima build. yt-dlp actual: **$V**.
 
           Descarga \`YouTubePy-latest.zip\` y descomprimelo en \`/roms/ports\`;
-          incluye el codigo y el binario ARM64 ya verificado.
+          incluye el codigo y el zipapp de yt-dlp ya verificado.
 
           \`mpv-aarch64.zip\` es una **dependencia opcional**: la app se la
           descarga sola desde este tag cuando la consola no trae mpv. No hay

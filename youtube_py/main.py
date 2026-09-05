@@ -406,6 +406,18 @@ class App(object):
                     self.status = "yt-dlp actualizado a %s" % v
             threading.Thread(target=upd, daemon=True).start()
 
+        # Precalentar el motor de yt-dlp mientras el usuario mira el feed.
+        # Importarlo cuesta ~6 s en esta CPU; hacerlo aqui, en segundo plano,
+        # significa que la primera reproduccion ya no los paga.
+        threading.Thread(
+            target=backend.warmup_ytdlp, args=(CFG["quality"],),
+            daemon=True).start()
+
+        # Reproductor: se comprueba al arrancar, no al pulsar play, para que
+        # el usuario se entere del problema antes de elegir un video.
+        if _which_player()[0] is None:
+            self._install_mpv()
+
         threading.Thread(target=self._load_home, daemon=True).start()
 
     # ---------- descarga automatica de yt-dlp ----------
