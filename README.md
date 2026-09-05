@@ -13,11 +13,15 @@ carpeta del port.
 ## Instalacion
 1. Copiar la carpeta `youtube_py/` a `/roms/ports/youtube_py/`
 2. Copiar `YouTubePy.sh` a `/roms/ports/YouTubePy.sh`
-3. Descargar el binario de yt-dlp para ARM64:
-   https://github.com/yt-dlp/yt-dlp/releases (archivo `yt-dlp_linux_aarch64`)
-   y guardarlo como `/roms/ports/youtube_py/yt-dlp.real` (con permisos de
-   ejecucion: `chmod +x yt-dlp.real`)
-4. Refrescar la lista de juegos. Listo: funciona sin cuenta.
+3. Refrescar la lista de juegos y abrir la app. En el primer arranque
+   descarga automaticamente yt-dlp (~36 MB, requiere WiFi) mostrando el
+   progreso en pantalla. Listo: funciona sin cuenta.
+
+### Instalacion manual de yt-dlp (solo si falla la descarga automatica)
+Descargar el binario de yt-dlp para ARM64:
+https://github.com/yt-dlp/yt-dlp/releases (archivo `yt-dlp_linux_aarch64`)
+y guardarlo como `/roms/ports/youtube_py/yt-dlp.real` (con permisos de
+ejecucion: `chmod +x yt-dlp.real`)
 
 ## Sesion de YouTube (opcional, para feed personalizado)
 1. En el PC, abrir una ventana de INCOGNITO -> youtube.com -> iniciar sesion

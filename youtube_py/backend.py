@@ -199,6 +199,108 @@ def channel_of(video_id):
         return ""
 
 
+YTDLP_URL = ("https://github.com/yt-dlp/yt-dlp/releases/latest/"
+             "download/yt-dlp_linux_aarch64")
+
+
+def ytdlp_present():
+    return os.path.exists(YTDLP)
+
+
+def download_ytdlp(progress_cb=None):
+    """Descarga yt-dlp (~36 MB) a BASE/yt-dlp.real con progreso 0-100.
+    Usa curl (TLS del sistema); lanza NetworkError si falla."""
+    global YTDLP
+    dest = os.path.join(BASE, "yt-dlp.real")
+    part = dest + ".part"
+    try:
+        os.remove(part)
+    except OSError:
+        pass
+    est_total = 38 * 1024 * 1024   # estimacion si no hay Content-Length
+    proc = subprocess.Popen(
+        ["curl", "-sS", "-L", "--insecure", "--max-time", "600",
+         "--connect-timeout", "15", "-o", part, YTDLP_URL],
+        stderr=subprocess.DEVNULL)
+    while proc.poll() is None:
+        if progress_cb:
+            try:
+                done = os.path.getsize(part)
+            except OSError:
+                done = 0
+            progress_cb(min(99, done * 100 // est_total))
+        import time
+        time.sleep(0.5)
+    ok = proc.returncode == 0
+    if ok:
+        try:
+            ok = os.path.getsize(part) >= 10 * 1024 * 1024
+        except OSError:
+            ok = False
+    if not ok:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        raise NetworkError("descarga fallida (red bloqueada o sin conexion)")
+    if progress_cb:
+        progress_cb(100)
+    os.replace(part, dest)
+    os.chmod(dest, 0o755)
+    YTDLP = dest
+    return True
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def latest_ytdlp_version():
+    """Version mas reciente publicada, leyendo el redirect de GitHub."""
+    opener = urllib.request.build_opener(
+        _NoRedirect, urllib.request.HTTPSHandler(context=SSL_CTX))
+    req = urllib.request.Request(
+        "https://github.com/yt-dlp/yt-dlp/releases/latest",
+        headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        opener.open(req, timeout=10)
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location", "")
+        if "/tag/" in loc:
+            return loc.rsplit("/tag/", 1)[1]
+    except (urllib.error.URLError, OSError):
+        pass
+    return None
+
+
+def current_ytdlp_version():
+    try:
+        out = subprocess.run([YTDLP, "--version"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=30).stdout
+        return out.decode().strip() or None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def update_ytdlp_if_needed():
+    """Si hay una version mas nueva, la descarga y reemplaza (atomico).
+    Devuelve la version nueva si actualizo, si no None."""
+    if not ytdlp_present():
+        return None
+    latest = latest_ytdlp_version()
+    if not latest:
+        return None
+    current = current_ytdlp_version()
+    if current == latest:
+        return None
+    try:
+        download_ytdlp()
+        return latest
+    except NetworkError:
+        return None
+
+
 def fetch_thumbnail(url, dest, timeout=8):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})

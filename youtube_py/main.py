@@ -62,6 +62,37 @@ BTN_COLORS = {"A": (200, 40, 40), "B": (220, 180, 30),
 
 SIDEBAR_ITEMS = ["Home", "Search", "Favorites", "History"]
 
+DL_TEXTS = {
+    "en": {
+        "title": "Downloading yt-dlp (video engine)",
+        "fail": "Download failed (no WiFi or GitHub down)",
+        "manual": [
+            "Manual install:",
+            "1. Download the ARM64 binary of yt-dlp:",
+            "   github.com/yt-dlp/yt-dlp/releases",
+            "   (file: yt-dlp_linux_aarch64)",
+            "2. Save it on the console as:",
+            "   /roms/ports/youtube_py/yt-dlp.real",
+            "3. Make it executable: chmod +x yt-dlp.real",
+        ],
+        "retry": "A: retry   B: continue without playback   Y: Espanol",
+    },
+    "es": {
+        "title": "Descargando yt-dlp (motor de video)",
+        "fail": "Fallo la descarga (sin WiFi o GitHub caido)",
+        "manual": [
+            "Instalacion manual:",
+            "1. Descargar el binario ARM64 de yt-dlp:",
+            "   github.com/yt-dlp/yt-dlp/releases",
+            "   (archivo: yt-dlp_linux_aarch64)",
+            "2. Guardarlo en la consola como:",
+            "   /roms/ports/youtube_py/yt-dlp.real",
+            "3. Permisos de ejecucion: chmod +x yt-dlp.real",
+        ],
+        "retry": "A: reintentar   B: continuar sin reproduccion   Y: English",
+    },
+}
+
 COOKIE_TEXTS = {
     "en": {
         "missing": "cookies.txt not found (not signed in)",
@@ -245,7 +276,86 @@ class App(object):
         self.favorites = self._load_json("favorites.json")
         self.history = self._load_json("history.json")
 
+        if not backend.ytdlp_present():
+            self._download_ytdlp()
+        else:
+            # en background: actualizar yt-dlp si hay version nueva
+            def upd():
+                v = backend.update_ytdlp_if_needed()
+                if v:
+                    self.status = "yt-dlp actualizado a %s" % v
+            threading.Thread(target=upd, daemon=True).start()
+
         threading.Thread(target=self._load_home, daemon=True).start()
+
+    # ---------- descarga automatica de yt-dlp ----------
+    def _download_ytdlp(self):
+        """Pantalla bloqueante: descarga yt-dlp con progreso; si falla,
+        instrucciones manuales con reintento."""
+        lang = ["en"]
+        while self.running and not backend.ytdlp_present():
+            progress = [0]
+            error = [False]
+            done = [False]
+
+            def worker():
+                try:
+                    backend.download_ytdlp(
+                        lambda p: progress.__setitem__(0, p))
+                except Exception:
+                    error[0] = True
+                done[0] = True
+            threading.Thread(target=worker, daemon=True).start()
+
+            ev = sdl2.SDL_Event()
+            frame = 0
+            while not done[0] and self.running:
+                while sdl2.SDL_PollEvent(ctypes.byref(ev)):
+                    if ev.type == sdl2.SDL_QUIT:
+                        self.running = False
+                t = DL_TEXTS[lang[0]]
+                self._draw_frame()
+                self._draw_loading("%s %d%%" % (t["title"], progress[0]),
+                                   frame)
+                sdl2.SDL_RenderPresent(self.ren)
+                frame += 1
+                sdl2.SDL_Delay(120)
+
+            if not error[0]:
+                return   # descargado
+
+            # fallo: instrucciones manuales + reintentar/continuar
+            choice = [None]
+            while choice[0] is None and self.running:
+                while sdl2.SDL_PollEvent(ctypes.byref(ev)):
+                    if ev.type == sdl2.SDL_QUIT:
+                        self.running = False
+                    elif ev.type == sdl2.SDL_CONTROLLERBUTTONDOWN:
+                        b = self.BTN.get(ev.cbutton.button)
+                        if b == "A":
+                            choice[0] = "retry"
+                        elif b == "B":
+                            choice[0] = "skip"
+                        elif b == "Y":
+                            lang[0] = "es" if lang[0] == "en" else "en"
+                t = DL_TEXTS[lang[0]]
+                self._draw_frame()
+                mw, mh = 470, 260
+                mx0 = UX + (UW - mw) // 2
+                my0 = UY + (UH - mh) // 2
+                self._fill(UX, UY, UW, UH, (0, 0, 0), 150)
+                self._fill_round(mx0, my0, mw, mh, C_MODAL, 250, rad=12)
+                self.text.draw(t["fail"], mx0 + 20, my0 + 14, 14,
+                               (230, 200, 60))
+                y = my0 + 46
+                for line in t["manual"]:
+                    self.text.draw(line, mx0 + 20, y, 12)
+                    y += 20
+                self.text.draw(t["retry"], mx0 + 20, my0 + mh - 26, 11, C_DIM)
+                sdl2.SDL_RenderPresent(self.ren)
+                sdl2.SDL_Delay(50)
+            if choice[0] == "skip":
+                return
 
     # ---------- display ----------
     def _open_display(self):
