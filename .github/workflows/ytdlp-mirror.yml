@@ -84,7 +84,6 @@ jobs:
           # Codigo de la app tal cual va en /roms/ports/youtube_py
           cp -r youtube_py/. pkg/youtube_py/
           cp YouTubePy.sh pkg/
-          cp README.md LICENSE pkg/ 2>/dev/null || true
           # Binario ya listo dentro del paquete: no hay descarga en el device
           cp yt-dlp_linux_aarch64 pkg/youtube_py/yt-dlp.real
           chmod 755 pkg/youtube_py/yt-dlp.real pkg/YouTubePy.sh
@@ -133,10 +132,6 @@ jobs:
             --title "YouTubePy - ultima build (yt-dlp $V)" \
             --notes "Apunta siempre a la ultima build. yt-dlp actual: **$V**.
 
-          Para instalar usa \`YouTubePy-latest.zip\` (codigo + binario incluido).
-
-          Los assets \`yt-dlp_linux_aarch64\` / \`.sha256\` **no son para descarga
-          manual**: los usa la app para autoactualizar el binario sin bajarse
-          el zip entero. No los borres." \
-            YouTubePy-latest.zip yt-dlp_linux_aarch64 \
-            yt-dlp_linux_aarch64.sha256 version.txt
+          Descarga \`YouTubePy-latest.zip\` y descomprimelo en \`/roms/ports\`;
+          incluye el codigo y el binario ARM64 ya verificado." \
+            YouTubePy-latest.zip version.txt

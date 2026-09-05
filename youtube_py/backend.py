@@ -199,17 +199,10 @@ def channel_of(video_id):
         return ""
 
 
-# Espejo propio (release generado a diario por GitHub Actions). Es el
-# origen preferido: URL estable, binario ya verificado y con .sha256.
-MIRROR_BASE = ("https://github.com/darkside-arm/YouTubePy/releases/"
-               "download/ytdlp-latest")
-MIRROR_URL = MIRROR_BASE + "/yt-dlp_linux_aarch64"
-MIRROR_SHA_URL = MIRROR_BASE + "/yt-dlp_linux_aarch64.sha256"
-MIRROR_VER_URL = MIRROR_BASE + "/version.txt"
-
-# Respaldo: descarga directa desde yt-dlp upstream.
-YTDLP_URL = ("https://github.com/yt-dlp/yt-dlp/releases/latest/"
-             "download/yt-dlp_linux_aarch64")
+# Descarga directa desde el repo oficial de yt-dlp.
+YTDLP_BASE = "https://github.com/yt-dlp/yt-dlp/releases/latest/download"
+YTDLP_URL = YTDLP_BASE + "/yt-dlp_linux_aarch64"
+YTDLP_SUMS_URL = YTDLP_BASE + "/SHA2-256SUMS"
 
 
 def ytdlp_present():
@@ -278,37 +271,45 @@ def _fetch_binary(url, part, expect_sha=None, progress_cb=None, resume=False):
     return True
 
 
+def _upstream_sha256():
+    """SHA-256 oficial de yt-dlp_linux_aarch64 segun SHA2-256SUMS."""
+    body = _curl_text(YTDLP_SUMS_URL, timeout=20)
+    if not body:
+        return None
+    for line in body.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1].lstrip("*") == "yt-dlp_linux_aarch64":
+            if len(parts[0]) == 64:
+                return parts[0]
+    return None
+
+
 def download_ytdlp(progress_cb=None):
     """Descarga yt-dlp (~36 MB) a BASE/yt-dlp.real con progreso 0-100.
 
-    Prueba primero el espejo propio (con verificacion SHA-256) y luego
-    upstream, reintentando y reanudando descargas cortadas.
+    Origen: repo oficial de yt-dlp. Verifica el SHA-256 contra el
+    SHA2-256SUMS publicado y reintenta reanudando descargas cortadas.
     Lanza NetworkError si todos los intentos fallan."""
     global YTDLP
     dest = os.path.join(BASE, "yt-dlp.real")
     part = dest + ".part"
 
-    sha = _curl_text(MIRROR_SHA_URL)
-    if sha:
-        sha = sha.split()[0]
-        if len(sha) != 64:
-            sha = None
+    sha = _upstream_sha256()
 
-    # (url, sha esperado, reanudar) en orden de preferencia
+    # (sha esperado, reanudar) en orden de preferencia
     attempts = [
-        (MIRROR_URL, sha, False),
-        (MIRROR_URL, sha, True),      # reanuda el .part cortado
-        (YTDLP_URL, None, False),
-        (YTDLP_URL, None, True),
+        (sha, False),
+        (sha, True),      # reanuda el .part cortado
+        (sha, False),     # ultimo intento desde cero
     ]
 
-    for url, expect, resume in attempts:
+    for expect, resume in attempts:
         if not resume:
             try:
                 os.remove(part)
             except OSError:
                 pass
-        if _fetch_binary(url, part, expect, progress_cb, resume):
+        if _fetch_binary(YTDLP_URL, part, expect, progress_cb, resume):
             if progress_cb:
                 progress_cb(100)
             os.replace(part, dest)
@@ -329,14 +330,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def latest_ytdlp_version():
-    """Version mas reciente disponible.
-
-    Preferimos version.txt del espejo (es la version del binario que
-    realmente vamos a descargar); si no responde, caemos al redirect
-    de GitHub upstream."""
-    ver = _curl_text(MIRROR_VER_URL, timeout=10)
-    if ver and len(ver) <= 32 and "<" not in ver:
-        return ver
+    """Version mas reciente publicada en el repo oficial de yt-dlp,
+    leyendo el redirect de GitHub."""
     opener = urllib.request.build_opener(
         _NoRedirect, urllib.request.HTTPSHandler(context=SSL_CTX))
     req = urllib.request.Request(
