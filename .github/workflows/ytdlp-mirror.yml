@@ -1,0 +1,142 @@
+name: Release diario (yt-dlp aarch64 + codigo)
+
+# Una vez al dia comprueba si yt-dlp publico una version nueva para ARM64.
+# Si la hay (o si se lanza a mano), genera un release de este repo con:
+#   - yt-dlp_linux_aarch64          binario suelto (verificado por SHA-256)
+#   - yt-dlp_linux_aarch64.sha256   hash oficial
+#   - version.txt                   version de yt-dlp incluida
+#   - YouTubePy-<ver>.zip           codigo completo + binario, listo para
+#                                   descomprimir en /roms/ports
+# Ademas mantiene el tag movil "ytdlp-latest" con los mismos assets, que es
+# el que usa la app para autoactualizarse (URL fija).
+
+on:
+  schedule:
+    - cron: "17 5 * * *"   # 05:17 UTC todos los dias
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Regenerar el release aunque no haya version nueva"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolver ultima version de yt-dlp
+        id: up
+        run: |
+          ver=$(curl -fsSL --retry 5 --retry-delay 5 \
+                https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest \
+                | jq -r .tag_name)
+          [ -n "$ver" ] && [ "$ver" != "null" ] || { echo "no version"; exit 1; }
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Upstream yt-dlp: $ver"
+
+      - name: Comprobar si ya publicamos esta version
+        id: have
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if gh release view "ytdlp-${{ steps.up.outputs.version }}" \
+               --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Ya existe el release, nada que hacer."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Descargar y verificar binario ARM64
+        if: steps.have.outputs.skip == 'false'
+        env:
+          V: ${{ steps.up.outputs.version }}
+        run: |
+          base="https://github.com/yt-dlp/yt-dlp/releases/download/$V"
+          curl -fsSL --retry 5 --retry-delay 5 -o yt-dlp_linux_aarch64 \
+               "$base/yt-dlp_linux_aarch64"
+          curl -fsSL --retry 5 --retry-delay 5 -o SHA2-256SUMS \
+               "$base/SHA2-256SUMS"
+          grep " yt-dlp_linux_aarch64$" SHA2-256SUMS > expected.sha256
+          sha256sum -c expected.sha256
+          [ "$(stat -c%s yt-dlp_linux_aarch64)" -ge 10000000 ] \
+            || { echo "binario demasiado pequeno"; exit 1; }
+          file yt-dlp_linux_aarch64 | grep -qi 'aarch64'
+          cut -d' ' -f1 expected.sha256 > yt-dlp_linux_aarch64.sha256
+          echo "$V" > version.txt
+
+      - name: Empaquetar codigo + binario
+        if: steps.have.outputs.skip == 'false'
+        id: pack
+        env:
+          V: ${{ steps.up.outputs.version }}
+        run: |
+          zipname="YouTubePy-$V.zip"
+          rm -rf pkg && mkdir -p pkg/youtube_py
+          # Codigo de la app tal cual va en /roms/ports/youtube_py
+          cp -r youtube_py/. pkg/youtube_py/
+          cp YouTubePy.sh pkg/
+          cp README.md LICENSE pkg/ 2>/dev/null || true
+          # Binario ya listo dentro del paquete: no hay descarga en el device
+          cp yt-dlp_linux_aarch64 pkg/youtube_py/yt-dlp.real
+          chmod 755 pkg/youtube_py/yt-dlp.real pkg/YouTubePy.sh
+          # Limpieza de restos que no deben viajar
+          find pkg -name '__pycache__' -type d -prune -exec rm -rf {} +
+          find pkg -name '*.pyc' -delete
+          rm -f pkg/youtube_py/log.txt pkg/youtube_py/cookies.txt \
+                pkg/youtube_py/yt-dlp.real.part
+          (cd pkg && zip -rq "../$zipname" .)
+          echo "zip=$zipname" >> "$GITHUB_OUTPUT"
+          unzip -l "$zipname" | tail -n 5
+
+      - name: Publicar release ytdlp-<version>
+        if: steps.have.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.up.outputs.version }}
+          ZIP: ${{ steps.pack.outputs.zip }}
+        run: |
+          gh release delete "ytdlp-$V" --repo "${{ github.repository }}" \
+            --cleanup-tag --yes 2>/dev/null || true
+          gh release create "ytdlp-$V" \
+            --repo "${{ github.repository }}" \
+            --title "YouTubePy - yt-dlp $V (linux aarch64)" \
+            --notes "Build automatico con yt-dlp **$V** para ARM64 (R36S/R36T/ArkOS).
+
+          **Instalacion:** descomprimir \`$ZIP\` dentro de \`/roms/ports\`
+          (deja \`YouTubePy.sh\` y la carpeta \`youtube_py/\` con el binario ya incluido).
+
+          Assets:
+          - \`$ZIP\` - codigo + yt-dlp ya empaquetado
+          - \`yt-dlp_linux_aarch64\` - solo el binario (renombrar a \`yt-dlp.real\`)
+          - \`yt-dlp_linux_aarch64.sha256\` - hash oficial verificado
+
+          Upstream: https://github.com/yt-dlp/yt-dlp/releases/tag/$V" \
+            "$ZIP" yt-dlp_linux_aarch64 yt-dlp_linux_aarch64.sha256 version.txt
+
+      - name: Actualizar tag movil ytdlp-latest
+        if: steps.have.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.up.outputs.version }}
+          ZIP: ${{ steps.pack.outputs.zip }}
+        run: |
+          cp "$ZIP" YouTubePy-latest.zip
+          gh release delete ytdlp-latest --repo "${{ github.repository }}" \
+            --cleanup-tag --yes 2>/dev/null || true
+          gh release create ytdlp-latest \
+            --repo "${{ github.repository }}" \
+            --title "YouTubePy - ultima build (yt-dlp $V)" \
+            --notes "Apunta siempre a la ultima build. yt-dlp actual: **$V**.
+
+          La app usa los assets de este tag para autoactualizar el binario." \
+            YouTubePy-latest.zip yt-dlp_linux_aarch64 \
+            yt-dlp_linux_aarch64.sha256 version.txt

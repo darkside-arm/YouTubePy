@@ -199,6 +199,15 @@ def channel_of(video_id):
         return ""
 
 
+# Espejo propio (release generado a diario por GitHub Actions). Es el
+# origen preferido: URL estable, binario ya verificado y con .sha256.
+MIRROR_BASE = ("https://github.com/darkside-arm/YouTubePy/releases/"
+               "download/ytdlp-latest")
+MIRROR_URL = MIRROR_BASE + "/yt-dlp_linux_aarch64"
+MIRROR_SHA_URL = MIRROR_BASE + "/yt-dlp_linux_aarch64.sha256"
+MIRROR_VER_URL = MIRROR_BASE + "/version.txt"
+
+# Respaldo: descarga directa desde yt-dlp upstream.
 YTDLP_URL = ("https://github.com/yt-dlp/yt-dlp/releases/latest/"
              "download/yt-dlp_linux_aarch64")
 
@@ -207,21 +216,44 @@ def ytdlp_present():
     return os.path.exists(YTDLP)
 
 
-def download_ytdlp(progress_cb=None):
-    """Descarga yt-dlp (~36 MB) a BASE/yt-dlp.real con progreso 0-100.
-    Usa curl (TLS del sistema); lanza NetworkError si falla."""
-    global YTDLP
-    dest = os.path.join(BASE, "yt-dlp.real")
-    part = dest + ".part"
+def _curl_text(url, timeout=15):
+    """Devuelve el cuerpo de una URL con curl, o None si falla."""
     try:
-        os.remove(part)
-    except OSError:
-        pass
+        out = subprocess.run(
+            ["curl", "-sS", "-L", "--insecure", "--max-time", str(timeout),
+             "--connect-timeout", "10", url],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=timeout + 5)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return out.stdout.decode().strip()
+    except UnicodeDecodeError:
+        return None
+
+
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _fetch_binary(url, part, expect_sha=None, progress_cb=None, resume=False):
+    """Un intento de descarga a `part`. True si quedo integro."""
+    import time
     est_total = 38 * 1024 * 1024   # estimacion si no hay Content-Length
-    proc = subprocess.Popen(
-        ["curl", "-sS", "-L", "--insecure", "--max-time", "600",
-         "--connect-timeout", "15", "-o", part, YTDLP_URL],
-        stderr=subprocess.DEVNULL)
+    cmd = ["curl", "-sS", "-L", "--insecure", "--max-time", "600",
+           "--connect-timeout", "15", "--retry", "3", "--retry-delay", "2",
+           "--speed-time", "45", "--speed-limit", "1024"]
+    if resume:
+        cmd += ["-C", "-"]
+    cmd += ["-o", part, url]
+    proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
     while proc.poll() is None:
         if progress_cb:
             try:
@@ -229,26 +261,66 @@ def download_ytdlp(progress_cb=None):
             except OSError:
                 done = 0
             progress_cb(min(99, done * 100 // est_total))
-        import time
         time.sleep(0.5)
-    ok = proc.returncode == 0
-    if ok:
+    if proc.returncode != 0:
+        return False
+    try:
+        if os.path.getsize(part) < 10 * 1024 * 1024:
+            return False
+    except OSError:
+        return False
+    if expect_sha:
         try:
-            ok = os.path.getsize(part) >= 10 * 1024 * 1024
+            if _sha256_file(part).lower() != expect_sha.lower():
+                return False
         except OSError:
-            ok = False
-    if not ok:
-        try:
-            os.remove(part)
-        except OSError:
-            pass
-        raise NetworkError("descarga fallida (red bloqueada o sin conexion)")
-    if progress_cb:
-        progress_cb(100)
-    os.replace(part, dest)
-    os.chmod(dest, 0o755)
-    YTDLP = dest
+            return False
     return True
+
+
+def download_ytdlp(progress_cb=None):
+    """Descarga yt-dlp (~36 MB) a BASE/yt-dlp.real con progreso 0-100.
+
+    Prueba primero el espejo propio (con verificacion SHA-256) y luego
+    upstream, reintentando y reanudando descargas cortadas.
+    Lanza NetworkError si todos los intentos fallan."""
+    global YTDLP
+    dest = os.path.join(BASE, "yt-dlp.real")
+    part = dest + ".part"
+
+    sha = _curl_text(MIRROR_SHA_URL)
+    if sha:
+        sha = sha.split()[0]
+        if len(sha) != 64:
+            sha = None
+
+    # (url, sha esperado, reanudar) en orden de preferencia
+    attempts = [
+        (MIRROR_URL, sha, False),
+        (MIRROR_URL, sha, True),      # reanuda el .part cortado
+        (YTDLP_URL, None, False),
+        (YTDLP_URL, None, True),
+    ]
+
+    for url, expect, resume in attempts:
+        if not resume:
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+        if _fetch_binary(url, part, expect, progress_cb, resume):
+            if progress_cb:
+                progress_cb(100)
+            os.replace(part, dest)
+            os.chmod(dest, 0o755)
+            YTDLP = dest
+            return True
+
+    try:
+        os.remove(part)
+    except OSError:
+        pass
+    raise NetworkError("descarga fallida (red bloqueada o sin conexion)")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -257,7 +329,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def latest_ytdlp_version():
-    """Version mas reciente publicada, leyendo el redirect de GitHub."""
+    """Version mas reciente disponible.
+
+    Preferimos version.txt del espejo (es la version del binario que
+    realmente vamos a descargar); si no responde, caemos al redirect
+    de GitHub upstream."""
+    ver = _curl_text(MIRROR_VER_URL, timeout=10)
+    if ver and len(ver) <= 32 and "<" not in ver:
+        return ver
     opener = urllib.request.build_opener(
         _NoRedirect, urllib.request.HTTPSHandler(context=SSL_CTX))
     req = urllib.request.Request(
