@@ -1,5 +1,6 @@
 """YouTube port para R36S/R36T - reescritura en Python + PySDL2.
 UI estilo original: sidebar, grid 2x2 de thumbnails, barra de ayuda."""
+import collections
 import ctypes
 import json
 import os
@@ -305,10 +306,15 @@ class ThumbLoader(object):
     """Descarga thumbnails en hilos; el hilo de render las sube a textura."""
 
     MAX_CACHED = 300   # limite de thumbnails en disco (~3 MB)
+    # Limite de texturas VIVAS en RAM. Una miniatura de 320x180 en RGBA ocupa
+    # 225 KB, asi que sin tope el scroll las va acumulando: 300 videos vistos
+    # serian 66 MB. Con 48 el techo queda en ~11 MB, de sobra para la rejilla
+    # visible y el prefetch de alrededor.
+    MAX_TEXTURES = 48
 
     def __init__(self):
         self.ready = {}      # video_id -> ruta de archivo descargado
-        self.textures = {}   # video_id -> SDL texture
+        self.textures = collections.OrderedDict()   # video_id -> SDL texture
         self.pending = set()
         self.failed = {}     # video_id -> tick del fallo (para reintentar)
         self.lock = threading.Lock()
@@ -353,17 +359,36 @@ class ThumbLoader(object):
             self.pending.discard(video.id)
 
     def texture(self, ren, video):
+        """Textura de la miniatura. Se llama SIEMPRE desde el hilo de render,
+        que es el unico que puede crear y destruir texturas SDL."""
         vid = video.id
-        if vid in self.textures:
-            return self.textures[vid]
+        tex = self.textures.get(vid)
+        if tex is not None:
+            self.textures.move_to_end(vid)      # LRU: recien usada
+            return tex
         with self.lock:
             path = self.ready.pop(vid, None)
         if path:
             tex = img.IMG_LoadTexture(ren, path.encode())
             if tex:
                 self.textures[vid] = tex
+                self._evict()
                 return tex
         return None
+
+    def _evict(self):
+        """Destruye las texturas mas antiguas por encima del tope."""
+        while len(self.textures) > self.MAX_TEXTURES:
+            _, old = self.textures.popitem(last=False)
+            sdl2.SDL_DestroyTexture(old)
+
+    def forget_textures(self):
+        """Olvida las texturas SIN destruirlas.
+
+        Se usa tras recrear el renderer: SDL_DestroyRenderer ya destruyo sus
+        texturas, asi que aqui solo quedan punteros colgando y llamar a
+        SDL_DestroyTexture seria un doble free."""
+        self.textures.clear()
 
 
 class App(object):
@@ -509,7 +534,7 @@ class App(object):
         sdl2.SDL_InitSubSystem(sdl2.SDL_INIT_VIDEO)
         self._open_display()
         self.text = TextCache(self.ren)
-        self.thumbs.textures.clear()
+        self.thumbs.forget_textures()
 
     def _open_pad(self):
         for i in range(sdl2.SDL_NumJoysticks()):

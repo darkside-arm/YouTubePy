@@ -222,7 +222,60 @@ def _ytdlp_cmd():
     return [YTDLP]
 
 
+def _video_from_entry(j):
+    """Construye un Video a partir de una entrada plana de yt-dlp."""
+    vid = j.get("id") or ""
+    # Mixes: playlist RD<id> -> video semilla
+    if vid.startswith("RD"):
+        vid = vid[2:]
+    if not vid:
+        return None
+    return Video(
+        id=vid, title=j.get("title") or "?",
+        channel=j.get("channel") or j.get("uploader") or "",
+        thumbnail="",  # usar mqdefault (320x180): 8x mas ligero que hq720
+        duration=int(j.get("duration") or 0),
+        view_count=int(j.get("view_count") or 0))
+
+
+def _flat_inprocess(url_or_query, limit, use_cookies, offset):
+    """Listado plano con el modulo ya importado. None si no esta disponible.
+
+    Evita lanzar un subproceso, que en esta CPU cuesta ~6 s y satura los 4
+    nucleos justo cuando se estan bajando las miniaturas."""
+    cookies = use_cookies and os.path.exists(COOKIES)
+    # Una sola instancia por modo (con o sin cookies). El rango se cambia
+    # mutando params en cada llamada: cachear una instancia por cada offset
+    # iria acumulando objetos YoutubeDL segun se pagina.
+    key = "flat:%s" % bool(cookies)
+    with _YDL_LOCK:
+        opts = {"extract_flat": "in_playlist", "ignoreerrors": True}
+        if cookies:
+            opts["cookiefile"] = COOKIES
+        ydl = _get_ydl(key, opts)
+        if ydl is None:
+            return None
+        ydl.params["playlist_items"] = "%d-%d" % (offset + 1, offset + limit)
+        try:
+            info = ydl.extract_info(url_or_query, download=False)
+        except Exception:                  # noqa: BLE001
+            return None
+    if not info:
+        return None
+    vids = []
+    for entry in (info.get("entries") or []):
+        if not entry:
+            continue
+        v = _video_from_entry(entry)
+        if v:
+            vids.append(v)
+    return vids
+
+
 def _ytdlp_flat(url_or_query, limit, use_cookies, offset=0):
+    r = _flat_inprocess(url_or_query, limit, use_cookies, offset)
+    if r is not None:
+        return r
     cmd = _ytdlp_cmd() + [
         "--flat-playlist", "--dump-json", "--no-warnings",
         "--ignore-errors", "--no-check-certificates",
@@ -242,18 +295,9 @@ def _ytdlp_flat(url_or_query, limit, use_cookies, offset=0):
             j = json.loads(line)
         except ValueError:
             continue
-        vid = j.get("id") or ""
-        # Mixes: playlist RD<id> -> video semilla
-        if vid.startswith("RD"):
-            vid = vid[2:]
-        if not vid:
-            continue
-        vids.append(Video(
-            id=vid, title=j.get("title") or "?",
-            channel=j.get("channel") or j.get("uploader") or "",
-            thumbnail="",  # usar mqdefault (320x180): 8x mas ligero que hq720
-            duration=int(j.get("duration") or 0),
-            view_count=int(j.get("view_count") or 0)))
+        v = _video_from_entry(j)
+        if v:
+            vids.append(v)
     return vids
 
 
