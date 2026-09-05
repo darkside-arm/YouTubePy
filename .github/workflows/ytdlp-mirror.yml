@@ -71,6 +71,49 @@ jobs:
             || { echo "binario demasiado pequeno"; exit 1; }
           file yt-dlp_linux_aarch64 | grep -qi 'aarch64'
 
+      - name: Construir dependencia mpv-aarch64.zip
+        if: steps.have.outputs.skip == 'false'
+        run: |
+          # Paquete de dependencia OPCIONAL, aparte del zip del port. La app
+          # lo descarga sola cuando no encuentra mpv en el sistema, y lo
+          # extrae en youtube_py/{bin,lib}. Nada se instala en el sistema.
+          #
+          # Incluye libgbm de mesa porque DarkOS/ArkOS sustituyen libgbm.so.1
+          # por un symlink a libMali.so, que no exporta
+          # gbm_surface_create_with_modifiers y hace que mpv aborte al arrancar.
+          set -e
+          rm -rf debs mpvroot mpvpkg && mkdir -p debs mpvroot mpvpkg/bin mpvpkg/lib
+          # Las rutas se resuelven contra el indice de TRIXIE, no listando el
+          # pool: el pool mezcla todas las suites y devolveria mpv de sid,
+          # que enlaza contra libavcodec mas nuevas de las que trae la consola.
+          curl -fsSL --retry 5 --retry-delay 5 -o Packages.gz \
+            http://deb.debian.org/debian/dists/trixie/main/binary-arm64/Packages.gz
+          for p in mpv libmujs3 libsixel1 libva-wayland2 libxpresent1 libgbm1; do
+            f=$(zcat Packages.gz | awk -v pkg="$p" '
+                  $1=="Package:" {cur=$2}
+                  $1=="Filename:" && cur==pkg {print $2; exit}')
+            [ -n "$f" ] || { echo "no se resolvio $p en trixie"; exit 1; }
+            echo "  $f"
+            curl -fsSL --retry 5 --retry-delay 5 \
+              -o "debs/$(basename "$f")" "http://deb.debian.org/debian/$f"
+          done
+          for d in debs/*.deb; do dpkg-deb -x "$d" mpvroot; done
+          cp mpvroot/usr/bin/mpv mpvpkg/bin/mpv
+          chmod 755 mpvpkg/bin/mpv
+          # /roms suele ser exFAT y no admite symlinks: se copian los ficheros
+          # reales con el nombre del SONAME.
+          for so in libgbm.so.1 libmujs.so.3 libsixel.so.1 \
+                    libva-wayland.so.2 libXpresent.so.1; do
+            real=$(find mpvroot -name "$so*" -type f | head -1)
+            [ -n "$real" ] || { echo "falta $so"; exit 1; }
+            cp "$real" "mpvpkg/lib/$so"
+          done
+          nm -D mpvpkg/lib/libgbm.so.1 | grep -q gbm_surface_create_with_modifiers \
+            || { echo "la libgbm descargada no trae el simbolo"; exit 1; }
+          file mpvpkg/bin/mpv | grep -qi aarch64
+          (cd mpvpkg && zip -rq ../mpv-aarch64.zip .)
+          ls -l mpv-aarch64.zip && unzip -l mpv-aarch64.zip
+
       - name: Empaquetar codigo + binario
         if: steps.have.outputs.skip == 'false'
         id: pack
@@ -88,6 +131,7 @@ jobs:
           # Limpieza de restos que no deben viajar
           find pkg -name '__pycache__' -type d -prune -exec rm -rf {} +
           find pkg -name '*.pyc' -delete
+          rm -rf pkg/youtube_py/bin pkg/youtube_py/lib
           rm -f pkg/youtube_py/log.txt pkg/youtube_py/cookies.txt \
                 pkg/youtube_py/yt-dlp.real.part
           (cd pkg && zip -rq "../$zipname" .)
@@ -113,7 +157,7 @@ jobs:
           ya incluido en \`youtube_py/yt-dlp.real\`, verificado por SHA-256).
 
           Upstream: https://github.com/yt-dlp/yt-dlp/releases/tag/$V" \
-            "$ZIP"
+            "$ZIP" mpv-aarch64.zip
 
       - name: Actualizar tag movil ytdlp-latest
         if: steps.have.outputs.skip == 'false'
@@ -131,5 +175,9 @@ jobs:
             --notes "Apunta siempre a la ultima build. yt-dlp actual: **$V**.
 
           Descarga \`YouTubePy-latest.zip\` y descomprimelo en \`/roms/ports\`;
-          incluye el codigo y el binario ARM64 ya verificado." \
-            YouTubePy-latest.zip
+          incluye el codigo y el binario ARM64 ya verificado.
+
+          \`mpv-aarch64.zip\` es una **dependencia opcional**: la app se la
+          descarga sola desde este tag cuando la consola no trae mpv. No hay
+          que instalarla a mano ni tocar el sistema." \
+            YouTubePy-latest.zip mpv-aarch64.zip

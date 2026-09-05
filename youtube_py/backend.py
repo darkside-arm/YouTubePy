@@ -173,7 +173,13 @@ def home_feed(limit=20, offset=0):
 
 
 def resolve_stream(video, quality=480):
-    """URL de stream. Sin cookies (PO token). Mixes ya normalizados en Video."""
+    """URL(s) de stream. Sin cookies (PO token). Mixes ya normalizados en Video.
+
+    Devuelve (video_url, audio_url). audio_url es None cuando el formato es
+    progresivo (video+audio en el mismo stream), que es el caso habitual.
+    Si yt-dlp cae en un formato DASH, `-g` imprime dos lineas (video y audio
+    por separado) y hay que pasarle las dos al reproductor: quedarse solo con
+    la primera daba reproduccion muda."""
     fmt = ("best[height<=%d][ext=mp4]/best[height<=%d][acodec!=none][vcodec!=none]"
            "/18/22/best[height<=%d]/best" % (quality, quality, quality))
     cmd = [YTDLP, "-f", fmt, "-g", "--no-warnings", "--no-check-certificates",
@@ -183,9 +189,11 @@ def resolve_stream(video, quality=480):
         out = subprocess.run(cmd, stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, timeout=60).stdout
     except (subprocess.TimeoutExpired, OSError):
-        return None
+        return None, None
     lines = out.decode(errors="replace").strip().splitlines()
-    return lines[0] if lines else None
+    if not lines:
+        return None, None
+    return lines[0], (lines[1] if len(lines) > 1 else None)
 
 
 def channel_of(video_id):
@@ -327,6 +335,84 @@ def download_ytdlp(progress_cb=None):
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **k):
         return None
+
+
+# ---------- dependencia opcional: mpv ----------
+# Paquete con mpv y las librerias que suelen faltar, publicado como asset del
+# release. No viaja dentro del zip del port: se descarga solo si la consola
+# no trae ningun reproductor usable.
+MPV_ZIP_URL = ("https://github.com/darkside-arm/YouTubePy/releases/"
+               "download/ytdlp-latest/mpv-aarch64.zip")
+MPV_BIN = os.path.join(BASE, "bin", "mpv")
+
+
+def mpv_present():
+    return os.access(MPV_BIN, os.X_OK)
+
+
+def download_mpv(progress_cb=None):
+    """Descarga y extrae la dependencia mpv en BASE/{bin,lib}.
+
+    No instala nada en el sistema: el binario y sus librerias quedan dentro
+    de la carpeta del port y solo los usa el reproductor (via
+    LD_LIBRARY_PATH). Lanza NetworkError si falla."""
+    import zipfile
+    part = os.path.join(BASE, "mpv-aarch64.zip.part")
+    try:
+        os.remove(part)
+    except OSError:
+        pass
+    est_total = 4 * 1024 * 1024
+    if not _fetch_binary_generic(MPV_ZIP_URL, part, est_total, progress_cb):
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        raise NetworkError("no se pudo descargar mpv")
+    try:
+        with zipfile.ZipFile(part) as z:
+            z.extractall(BASE)
+    except (zipfile.BadZipFile, OSError) as e:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        raise NetworkError("paquete mpv corrupto: %s" % e)
+    try:
+        os.remove(part)
+    except OSError:
+        pass
+    try:
+        os.chmod(MPV_BIN, 0o755)
+    except OSError:
+        pass
+    if progress_cb:
+        progress_cb(100)
+    return mpv_present()
+
+
+def _fetch_binary_generic(url, part, est_total, progress_cb=None):
+    """Descarga con curl mostrando progreso estimado. True si parece integra."""
+    import time
+    proc = subprocess.Popen(
+        ["curl", "-sS", "-L", "--insecure", "--max-time", "600",
+         "--connect-timeout", "15", "--retry", "3", "--retry-delay", "2",
+         "--speed-time", "45", "--speed-limit", "1024", "-o", part, url],
+        stderr=subprocess.DEVNULL)
+    while proc.poll() is None:
+        if progress_cb:
+            try:
+                done = os.path.getsize(part)
+            except OSError:
+                done = 0
+            progress_cb(min(99, done * 100 // est_total))
+        time.sleep(0.5)
+    if proc.returncode != 0:
+        return False
+    try:
+        return os.path.getsize(part) > 100 * 1024
+    except OSError:
+        return False
 
 
 def latest_ytdlp_version():

@@ -40,6 +40,126 @@ def _margin(axis):
     return _auto_margin() if v == "auto" else int(v)
 
 
+# Reproductores por orden de preferencia. mpv es el bueno, pero no viene en
+# todas las imagenes (DarkOS 13 no lo trae), asi que hay un respaldo.
+# ffplay queda descartado: no admite pista de audio separada (DASH sin
+# sonido) y no expone control de buffer de red.
+PLAYERS = ("mpv", "cvlc", "vlc")
+
+# Directorios donde buscar el binario. BASE/bin va primero por si el port
+# trae su propio mpv empaquetado.
+PLAYER_DIRS = (os.path.join(BASE, "bin"), "/usr/bin", "/usr/local/bin", "/bin")
+
+
+def _is_root():
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def _desktop_user():
+    """Usuario normal al que degradar privilegios (VLC no arranca como root).
+
+    El launcher hace 'sudo env ... python3 main.py', asi que SUDO_USER trae
+    el usuario original. Si no, se busca el primer UID 1000 (ark en ArkOS
+    y DarkOS)."""
+    u = os.environ.get("SUDO_USER") or ""
+    if u and u != "root":
+        return u
+    try:
+        with open("/etc/passwd") as f:
+            for line in f:
+                p = line.split(":")
+                if len(p) > 2 and p[2] == "1000":
+                    return p[0]
+    except OSError:
+        pass
+    return ""
+
+
+def _find_exe(name):
+    for d in PLAYER_DIRS:
+        p = os.path.join(d, name)
+        if os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _drop_prefix(name):
+    """Prefijo para lanzar VLC como usuario normal.
+
+    VLC aborta con 'VLC is not supposed to be run as root', y el port corre
+    como root porque PortMaster lo lanza con sudo. Devuelve None si no hay
+    forma de degradar, para que ese reproductor se descarte."""
+    if name not in ("vlc", "cvlc") or not _is_root():
+        return []
+    user = _desktop_user()
+    sudo = _find_exe("sudo")
+    if not user or not sudo:
+        return None
+    home = os.path.expanduser("~" + user)
+    if not os.path.isdir(home):
+        home = "/tmp"
+    return [sudo, "-u", user, "env", "HOME=" + home]
+
+
+def _which_player():
+    """Primer reproductor disponible y utilizable en este entorno."""
+    for name in CFG.get("video", {}).get("players", PLAYERS):
+        path = _find_exe(name)
+        if not path:
+            continue
+        if _drop_prefix(name) is None:
+            continue   # VLC como root y sin forma de degradar: inservible
+        return name, path
+    return None, None
+
+
+def _player_env():
+    """Entorno para el reproductor.
+
+    Algunas imagenes (DarkOS/ArkOS) sustituyen libgbm.so.1 por un symlink a
+    libMali.so, que no exporta gbm_surface_create_with_modifiers y hace que
+    mpv aborte nada mas arrancar. Si el port trae su propia copia de la
+    libgbm de mesa en youtube_py/lib, se antepone solo para el reproductor;
+    el resto del sistema sigue usando la de Mali."""
+    env = dict(os.environ)
+    libdir = os.path.join(BASE, "lib")
+    if os.path.isdir(libdir):
+        prev = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = libdir + (":" + prev if prev else "")
+    return env
+
+
+def _player_cmd(name, path, url, audio_url):
+    """Linea de comandos del reproductor, con la pista de audio separada
+    cuando el formato es DASH (audio_url no es None)."""
+    extra = CFG.get("video", {}).get(name + "_args", [])
+    if name == "mpv":
+        cmd = [path, "--fs", "--no-terminal", "--really-quiet"]
+        if audio_url:
+            cmd.append("--audio-file=" + audio_url)
+        return cmd + extra + [url]
+    # vlc / cvlc. cvlc ya es un wrapper que hace "vlc -I dummy", asi que
+    # solo hay que forzar la interfaz nula cuando se invoca vlc a secas.
+    cmd = [path, "--play-and-exit", "--no-osd"]
+    if name == "vlc":
+        cmd[1:1] = ["-I", "dummy"]
+    if audio_url:
+        cmd.append("--input-slave=" + audio_url)
+    return (_drop_prefix(name) or []) + cmd + extra + [url]
+
+
+NO_PLAYER_TEXT = [
+    "No se encontro ningun reproductor de video usable.",
+    "",
+    "Instala mpv en la consola (por SSH o terminal):",
+    "  sudo apt install mpv",
+    "",
+    "VLC sirve de respaldo, pero se niega a correr como",
+    "root: hace falta el usuario ark y sudo para bajarle",
+    "los privilegios.",
+]
+
+
 MX, MY = _margin("margin_x"), _margin("margin_y")
 # area util (dentro del bisel)
 UX, UY, UW, UH = MX, MY, LW - 2 * MX, LH - 2 * MY
@@ -498,6 +618,64 @@ class App(object):
         threading.Thread(target=worker, daemon=True).start()
 
     # ---------- playback ----------
+    def _install_mpv(self):
+        """Descarga la dependencia mpv (~4 MB) tras confirmar con el usuario.
+
+        No instala nada en el sistema: queda en youtube_py/{bin,lib} y solo
+        la usa el reproductor. Devuelve True si mpv quedo disponible."""
+        ev = sdl2.SDL_Event()
+        choice = [None]
+        info = [
+            "Esta consola no trae ningun reproductor de video.",
+            "",
+            "Puedo descargar mpv (unos 4 MB) dentro de la",
+            "carpeta del port. No se instala nada en el",
+            "sistema y se borra quitando la carpeta.",
+        ]
+        while choice[0] is None and self.running:
+            while sdl2.SDL_PollEvent(ctypes.byref(ev)):
+                if ev.type == sdl2.SDL_QUIT:
+                    self.running = False
+                elif ev.type == sdl2.SDL_CONTROLLERBUTTONDOWN:
+                    b = self.BTN.get(ev.cbutton.button)
+                    if b == "A":
+                        choice[0] = "yes"
+                    elif b == "B":
+                        choice[0] = "no"
+            self._modal_box("Falta un reproductor de video", info,
+                            "A = descargar mpv    B = cancelar")
+            sdl2.SDL_RenderPresent(self.ren)
+            sdl2.SDL_Delay(50)
+        if choice[0] != "yes":
+            return False
+
+        progress = [0]
+        error = [None]
+
+        def worker():
+            try:
+                backend.download_mpv(lambda p: progress.__setitem__(0, p))
+            except backend.NetworkError as e:
+                error[0] = str(e)
+            except Exception as e:            # noqa: BLE001
+                error[0] = str(e)
+        th = threading.Thread(target=worker, daemon=True)
+        th.start()
+        while th.is_alive() and self.running:
+            while sdl2.SDL_PollEvent(ctypes.byref(ev)):
+                if ev.type == sdl2.SDL_QUIT:
+                    self.running = False
+            self._draw_frame()
+            self._draw_loading("Descargando mpv %d%%" % progress[0], 0)
+            sdl2.SDL_RenderPresent(self.ren)
+            sdl2.SDL_Delay(120)
+        if error[0]:
+            self._error_modal("No se pudo descargar mpv",
+                              ["Error: " + error[0][:44], "",
+                               "Revisa la conexion WiFi y vuelve a intentarlo."])
+            return False
+        return True
+
     def play(self, video):
         if video.is_notice:
             return
@@ -505,7 +683,8 @@ class App(object):
         result = {}
 
         def worker():
-            result["url"] = backend.resolve_stream(video, CFG["quality"])
+            result["url"], result["audio"] = backend.resolve_stream(
+                video, CFG["quality"])
         th = threading.Thread(target=worker, daemon=True)
         th.start()
         frame = 0
@@ -522,13 +701,23 @@ class App(object):
         if not url:
             self.status = "Sin conexion o video no disponible"
             return
+        name, path = _which_player()
+        if not name:
+            if not self._install_mpv():
+                return
+            name, path = _which_player()
+            if not name:
+                self._error_modal("Falta un reproductor de video",
+                                  NO_PLAYER_TEXT)
+                self.running = False
+                return
         self.history = [video] + [v for v in self.history if v.id != video.id]
         self._save_json("history.json", self.history[:100])
         self._close_display()
         try:
-            proc = subprocess.Popen(["/usr/bin/mpv", "--fs", "--no-terminal",
-                                     "--really-quiet"]
-                                    + CFG["video"]["mpv_args"] + [url])
+            proc = subprocess.Popen(
+                _player_cmd(name, path, url, result.get("audio")),
+                env=_player_env())
             # B = salir del video (mismo boton que atras en la app).
             was_down = True   # ignorar si B sigue pulsado al entrar
             while proc.poll() is None:
@@ -773,6 +962,38 @@ class App(object):
         dots = "." * (1 + frame % 3)
         self.text.draw(spin, x + 18, y + 18, 14, C_SEL)
         self.text.draw(label + dots, x + 38, y + 18, 14)
+
+    def _modal_box(self, title, lines, footer):
+        """Dibuja (sin bloquear) una caja modal con titulo, texto y pie."""
+        mw, mh = 470, 220
+        mx0 = UX + (UW - mw) // 2
+        my0 = UY + (UH - mh) // 2
+        self._draw_frame()
+        self._fill(UX, UY, UW, UH, (0, 0, 0), 150)
+        self._fill_round(mx0, my0, mw, mh, C_MODAL, 250, rad=12)
+        self.text.draw(title, mx0 + 20, my0 + 14, 14, (230, 200, 60))
+        y = my0 + 46
+        for line in lines:
+            self.text.draw(line, mx0 + 20, y, 12)
+            y += 20
+        self.text.draw(footer, mx0 + 20, my0 + mh - 26, 11, C_DIM)
+
+    def _error_modal(self, title, lines, footer="A / B = salir"):
+        """Ventana de error bloqueante. Devuelve al pulsar A o B."""
+        ev = sdl2.SDL_Event()
+        done = False
+        while not done and self.running:
+            while sdl2.SDL_PollEvent(ctypes.byref(ev)):
+                if ev.type == sdl2.SDL_QUIT:
+                    self.running = False
+                elif ev.type == sdl2.SDL_CONTROLLERBUTTONDOWN:
+                    if self.BTN.get(ev.cbutton.button) in ("A", "B"):
+                        done = True
+                elif ev.type == sdl2.SDL_KEYDOWN:
+                    done = True
+            self._modal_box(title, lines, footer)
+            sdl2.SDL_RenderPresent(self.ren)
+            sdl2.SDL_Delay(50)
 
     def _draw_frame(self):
         sdl2.SDL_SetRenderDrawColor(self.ren, *C_BG, 255)
