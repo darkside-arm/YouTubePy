@@ -112,15 +112,11 @@ jobs:
             --notes "Build automatico con yt-dlp **$V** para ARM64 (R36S/R36T/ArkOS).
 
           **Instalacion:** descomprimir \`$ZIP\` dentro de \`/roms/ports\`
-          (deja \`YouTubePy.sh\` y la carpeta \`youtube_py/\` con el binario ya incluido).
-
-          Assets:
-          - \`$ZIP\` - codigo + yt-dlp ya empaquetado
-          - \`yt-dlp_linux_aarch64\` - solo el binario (renombrar a \`yt-dlp.real\`)
-          - \`yt-dlp_linux_aarch64.sha256\` - hash oficial verificado
+          (deja \`YouTubePy.sh\` y la carpeta \`youtube_py/\` con el binario
+          ya incluido en \`youtube_py/yt-dlp.real\`, verificado por SHA-256).
 
           Upstream: https://github.com/yt-dlp/yt-dlp/releases/tag/$V" \
-            "$ZIP" yt-dlp_linux_aarch64 yt-dlp_linux_aarch64.sha256 version.txt
+            "$ZIP" version.txt
 
       - name: Actualizar tag movil ytdlp-latest
         if: steps.have.outputs.skip == 'false'
@@ -137,6 +133,10 @@ jobs:
             --title "YouTubePy - ultima build (yt-dlp $V)" \
             --notes "Apunta siempre a la ultima build. yt-dlp actual: **$V**.
 
-          La app usa los assets de este tag para autoactualizar el binario." \
+          Para instalar usa \`YouTubePy-latest.zip\` (codigo + binario incluido).
+
+          Los assets \`yt-dlp_linux_aarch64\` / \`.sha256\` **no son para descarga
+          manual**: los usa la app para autoactualizar el binario sin bajarse
+          el zip entero. No los borres." \
             YouTubePy-latest.zip yt-dlp_linux_aarch64 \
             yt-dlp_linux_aarch64.sha256 version.txt
