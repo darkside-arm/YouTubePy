@@ -1,7 +1,7 @@
 {
     "ui":  {
-               "logical_w":  640,
-               "logical_h":  480,
+               "logical_w":  "auto",
+               "logical_h":  "auto",
                "margin_x":  "auto",
                "margin_y":  "auto"
            },

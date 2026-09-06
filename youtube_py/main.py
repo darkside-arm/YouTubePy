@@ -23,21 +23,68 @@ except Exception:
 import backend
 
 CFG = json.load(open(os.path.join(BASE, "config.json")))
-LW, LH = CFG["ui"]["logical_w"], CFG["ui"]["logical_h"]
+
+
+def _panel_size():
+    """Resolucion real del panel, leida del framebuffer.
+
+    Hay consolas de 640x480 (4:3) y otras de 720x720 (1:1), asi que nada de
+    tamanos fijos. Si no se puede leer, se asume 640x480."""
+    try:
+        with open("/sys/class/graphics/fb0/virtual_size") as f:
+            w, h = f.read().strip().split(",")
+            if int(w) > 0 and int(h) > 0:
+                return int(w), int(h)
+    except (OSError, ValueError):
+        pass
+    return 640, 480
+
+
+PANEL_W, PANEL_H = _panel_size()
+
+
+def _logical_size():
+    """Tamano logico de la UI. Con "auto" se usa el panel nativo."""
+    ui = CFG.get("ui", {})
+    w, h = ui.get("logical_w", "auto"), ui.get("logical_h", "auto")
+    if w == "auto" or h == "auto":
+        return PANEL_W, PANEL_H
+    try:
+        return int(w), int(h)
+    except (TypeError, ValueError):
+        return PANEL_W, PANEL_H
+
+
+LW, LH = _logical_size()
+
+# Consolas cuyo marco fisico tapa los bordes de la pantalla. "R36T" tambien
+# cubre la "R36T MAX" de AISLPC, que es 720x720 con bisel.
+BEZEL_MODELS = ("R36T", "K36S")
+# El margen se guarda como FRACCION del ancho, no en pixeles: 35 px en un
+# panel de 640 es un 5.5%, que en uno de 720 son 39 px. Con un valor fijo el
+# recorte se quedaria corto en las pantallas grandes.
+BEZEL_FRACTION = 0.0547        # 35/640
+NO_BEZEL_FRACTION = 0.0125     # 8/640
+
+
+def _device_model():
+    try:
+        with open("/proc/device-tree/model", "rb") as f:
+            return f.read().decode(errors="replace").replace("\0", "")
+    except OSError:
+        return ""
 
 
 def _auto_margin():
-    """R36T/K36S (bisel tipo TV que tapa los bordes) -> 35 px; resto -> 8."""
-    try:
-        with open("/proc/device-tree/model", "rb") as f:
-            model = f.read().decode(errors="replace")
-    except OSError:
-        model = ""
-    return 35 if ("R36T" in model or "K36S" in model) else 8
+    """Margen para esquivar el bisel, proporcional al tamano del panel."""
+    model = _device_model()
+    frac = (BEZEL_FRACTION if any(m in model for m in BEZEL_MODELS)
+            else NO_BEZEL_FRACTION)
+    return int(round(LW * frac))
 
 
 def _margin(axis):
-    v = CFG["ui"].get(axis, "auto")
+    v = CFG.get("ui", {}).get(axis, "auto")
     return _auto_margin() if v == "auto" else int(v)
 
 
@@ -127,7 +174,7 @@ def _osd_setup_ipc():
     Se reenvian con cada aviso: asi el texto sale centrado y en amarillo
     aunque mpv se hubiera lanzado sin esos parametros (por ejemplo tras
     actualizar el codigo con un video ya en marcha)."""
-    _, h = _screen_size()
+    _, h = (PANEL_W, PANEL_H)
     return [
         ["set", "osd-align-x", "center"],
         ["set", "osd-align-y", "center"],
@@ -249,19 +296,6 @@ def _wait_replies(sock, n, timeout=1.0):
     return len(seen) >= n
 
 
-def _screen_size():
-    """Resolucion real de la pantalla, leida del framebuffer.
-
-    Se usa para dimensionar el OSD de mpv. Si no se puede leer, se cae a la
-    resolucion logica de la UI."""
-    try:
-        with open("/sys/class/graphics/fb0/virtual_size") as f:
-            w, h = f.read().strip().split(",")
-            return int(w), int(h)
-    except (OSError, ValueError):
-        return LW, LH
-
-
 def _osd_args():
     """OSD de mpv: centrado, amarillo y proporcional a la pantalla.
 
@@ -270,7 +304,7 @@ def _osd_args():
     El tamano se calcula desde la altura real (1/12 de la pantalla) y se
     desactiva el escalado propio de mpv, que toma 720p como referencia y
     dejaria la letra a dos tercios en un panel de 480."""
-    _, h = _screen_size()
+    _, h = (PANEL_W, PANEL_H)
     return [
         "--osd-align-x=center",
         "--osd-align-y=center",
@@ -312,6 +346,17 @@ NO_PLAYER_TEXT = [
 MX, MY = _margin("margin_x"), _margin("margin_y")
 # area util (dentro del bisel)
 UX, UY, UW, UH = MX, MY, LW - 2 * MX, LH - 2 * MY
+
+
+def _recalc_layout():
+    """Recalcula el area util tras cambiar el margen en Ajustes.
+
+    Solo toca margenes, no el tamano logico: cambiar ese exigiria recrear el
+    renderer, asi que se aplica al reiniciar."""
+    global MX, MY, UX, UY, UW, UH
+    MX, MY = _margin("margin_x"), _margin("margin_y")
+    UX, UY, UW, UH = MX, MY, LW - 2 * MX, LH - 2 * MY
+
 
 THUMB_DIR = os.path.join(BASE, ".thumbs")
 FONT_PATHS = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -368,6 +413,7 @@ TEXTS = {
         "cookies_done": "cookies.txt deleted",
         "cookies_none": "There was no cookies.txt",
         "panel_max": "max %dp",
+        "set_margin": "Screen margin (bezel)", "set_panel": "Panel",
         "osd_hint": "A: pause   Y: fit   B: exit",
         "osd_play": "Play", "osd_pause": "Pause",
         "aspect_fit": "Fit", "aspect_fit_hint": "black bars, nothing cropped",
@@ -405,6 +451,7 @@ TEXTS = {
         "cookies_done": "cookies.txt borrado",
         "cookies_none": "No habia cookies.txt",
         "panel_max": "maximo %dp",
+        "set_margin": "Margen de pantalla (bisel)", "set_panel": "Panel",
         "osd_hint": "A: pausa   Y: encaje   B: salir",
         "osd_play": "Play", "osd_pause": "Pausa",
         "aspect_fit": "Ajustar", "aspect_fit_hint": "barras negras, se ve todo",
@@ -1250,19 +1297,28 @@ class App(object):
 
         No tiene sentido pedir 720p en una pantalla de 480: solo gastaria CPU
         decodificando pixeles que hay que tirar al escalar."""
-        _, panel_h = _screen_size()
+        panel_h = PANEL_H
         return [q for q in (144, 240, 360, 480, 720) if q <= panel_h] or [360]
+
+    def _margin_options(self):
+        """Margenes ofrecidos, hasta un 12% del ancho del panel."""
+        top = int(LW * 0.12)
+        return list(range(0, top + 1, 4)) or [0]
 
     def _settings_items(self):
         """Lista de (clave, etiqueta, valor_mostrado). Se recalcula al vuelo
         para que refleje el idioma y los valores actuales."""
-        _, panel_h = _screen_size()
+        panel_h = PANEL_H
         langs = {"en": "English", "es": "Espanol"}
+        auto = "" if CFG.get("ui", {}).get("margin_x", "auto") != "auto" \
+            else "  (auto)"
         return [
             ("lang", T("set_lang"), langs.get(LANG[0], LANG[0])),
             ("quality", T("set_quality"),
              "%dp   %s" % (CFG["quality"], T("panel_max") % panel_h)),
             ("aspect", T("set_aspect"), T(ASPECT_MODES[self.aspect][0])),
+            ("margin", T("set_margin"), "%d px%s" % (MX, auto)),
+            ("panel", T("set_panel"), "%dx%d" % (PANEL_W, PANEL_H)),
             ("cache", T("set_clear_cache"), T("set_action")),
             ("cookies", T("set_clear_cookies"), T("set_action")),
         ]
@@ -1275,6 +1331,17 @@ class App(object):
             LANG[0] = order[(order.index(LANG[0]) + delta) % len(order)]
             self.cookie_lang = LANG[0]
             self._save_config()
+        elif key == "margin":
+            opts = self._margin_options()
+            # Se parte del valor efectivo actual, venga de "auto" o fijado.
+            i = min(range(len(opts)), key=lambda k: abs(opts[k] - MX))
+            v = opts[(i + delta) % len(opts)]
+            CFG.setdefault("ui", {})["margin_x"] = v
+            CFG["ui"]["margin_y"] = v
+            _recalc_layout()
+            self._save_config()
+        elif key == "panel":
+            pass          # solo informativo
         elif key == "quality":
             opts = self._quality_options()
             i = opts.index(CFG["quality"]) if CFG["quality"] in opts else 0
@@ -1605,10 +1672,12 @@ class App(object):
             self.text.draw(label, gx, y, 14, C_TEXT if sel else C_DIM)
             # Las acciones se pintan en ambar: no cambian un valor, ejecutan.
             col = (230, 200, 60) if key in ("cache", "cookies") else C_TEXT
+            if key == "panel":
+                col = C_DIM
             vw = self.text.tex(value, 12, col)
             x = gx + gw - 18 - (vw[1] if vw else 0)
             self.text.draw(value, x, y + 3, 12, col)
-            if sel and key not in ("cache", "cookies"):
+            if sel and key not in ("cache", "cookies", "panel"):
                 self.text.draw("<", gx + gw - 12, y + 3, 12, C_SEL)
             y += 34
         if self.status:
