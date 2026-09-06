@@ -146,9 +146,9 @@ def _ytdlp_module():
     """Importa yt_dlp desde el zipapp. Devuelve el modulo o None."""
     if _YDL_MODULE[0] is not None:
         return _YDL_MODULE[0] or None
-    # El zipapp oficial exige Python 3.9+; en imagenes mas viejas se usa el
-    # binario por subproceso.
-    if sys.version_info < (3, 9) or not os.path.exists(YTDLP_ZIP):
+    # El zipapp lleva dentro un guardia explicito que aborta con ImportError
+    # en versiones viejas (ver YTDLP_MIN_PY); ahi toca el binario.
+    if not _use_zipapp() or not os.path.exists(YTDLP_ZIP):
         _YDL_MODULE[0] = False
         return None
     try:
@@ -237,7 +237,7 @@ def ytdlp_inprocess():
 
 def _ytdlp_cmd():
     """Prefijo de comando para invocar yt-dlp como subproceso."""
-    if os.path.exists(YTDLP_ZIP) and sys.version_info >= (3, 9):
+    if os.path.exists(YTDLP_ZIP) and _use_zipapp():
         return [sys.executable, YTDLP_ZIP]
     return [YTDLP]
 
@@ -432,9 +432,17 @@ YTDLP_ZIP_URL = YTDLP_BASE + "/yt-dlp"      # zipapp python puro (~3 MB)
 YTDLP_SUMS_URL = YTDLP_BASE + "/SHA2-256SUMS"
 
 
+# Version minima de Python que acepta el zipapp de yt-dlp. No es una
+# limitacion de sintaxis: yt_dlp/__init__.py trae un guardia explicito que
+# lanza ImportError ("Only Python versions 3.10 and above are supported").
+# Comprobado en la XiFan XF40H (Ubuntu 19.10, Python 3.7.5). Por debajo de
+# esto hay que usar el binario PyInstaller, que lleva su propio interprete.
+YTDLP_MIN_PY = (3, 10)
+
+
 def _use_zipapp():
-    """El zipapp necesita Python 3.9+; si no, toca el binario de 36 MB."""
-    return sys.version_info >= (3, 9)
+    """True si este Python puede con el zipapp (~3 MB); si no, binario."""
+    return sys.version_info >= YTDLP_MIN_PY
 
 
 def ytdlp_present():
