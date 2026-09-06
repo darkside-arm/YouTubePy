@@ -356,19 +356,33 @@ def resolve_stream(video, quality=480):
     r = _resolve_inprocess(video, quality, hq=False)
     if r is not None:
         return r
+    # Sin motor en proceso (Python < 3.9): subproceso, tambien probando
+    # primero el DASH de 480p y cayendo al progresivo de 360p.
+    for hq in (True, False):
+        r = _resolve_subprocess(video, quality, hq)
+        if r is not None:
+            return r
+    return None, None
+
+
+def _resolve_subprocess(video, quality, hq):
+    """Resolucion lanzando yt-dlp como proceso. None si falla."""
+    opts = _stream_opts(quality, hq)
     cmd = _ytdlp_cmd() + [
-        "-f", _stream_format(quality), "-g", "--no-warnings",
-        "--no-check-certificates", "--no-playlist",
-        "--extractor-args", "youtube:player_client=android,web",
-        video.url]
+        "-f", opts["format"], "-g", "--no-warnings",
+        "--no-check-certificates", "--no-playlist"]
+    if not hq:
+        cmd += ["--extractor-args", "youtube:player_client=android,web"]
+    cmd.append(video.url)
     try:
         out = subprocess.run(cmd, stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, timeout=60).stdout
+                             stderr=subprocess.DEVNULL, timeout=90).stdout
     except (subprocess.TimeoutExpired, OSError):
-        return None, None
+        return None
     lines = out.decode(errors="replace").strip().splitlines()
+    lines = [l for l in lines if l.startswith("http")]
     if not lines:
-        return None, None
+        return None
     return lines[0], (lines[1] if len(lines) > 1 else None)
 
 
