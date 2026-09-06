@@ -123,6 +123,10 @@ jobs:
           # Limpieza de restos que no deben viajar
           find pkg -name '__pycache__' -type d -prune -exec rm -rf {} +
           find pkg -name '*.pyc' -delete
+          # Saneo de finales de linea: un YouTubePy.sh con CRLF hace que bash
+          # falle con "$'\r': command not found" y el port no arranca.
+          find pkg -type f \( -name '*.sh' -o -name '*.py' -o -name '*.json' \) \
+            -exec sed -i 's/\r$//' {} +
           rm -rf pkg/youtube_py/bin pkg/youtube_py/lib
           rm -f pkg/youtube_py/log.txt pkg/youtube_py/cookies.txt \
                 pkg/youtube_py/yt-dlp.real pkg/youtube_py/yt-dlp.real.part \
