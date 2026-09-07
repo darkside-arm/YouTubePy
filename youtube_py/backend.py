@@ -351,9 +351,14 @@ def _stream_format(quality):
 def resolve_stream(video, quality=480):
     """URL(s) de stream. Sin cookies (PO token). Mixes ya normalizados en Video.
 
-    Devuelve (video_url, audio_url). Con DASH (el caso normal, que es donde
-    hay 480p real) vienen video y audio separados y hay que pasar los dos al
-    reproductor: quedarse solo con el primero da reproduccion muda.
+    Devuelve (video_url, audio_url, user_agent). Con DASH (el caso normal,
+    que es donde hay 480p real) vienen video y audio separados y hay que
+    pasar los dos al reproductor: quedarse solo con el primero da
+    reproduccion muda.
+
+    user_agent es el UA con el que yt-dlp resolvio las URLs: googlevideo
+    liga la URL firmada al cliente, y pedirla con otro UA (el de mpv/ffmpeg)
+    devuelve 403 Forbidden. El reproductor debe usar este mismo UA.
 
     Tres intentos, de mejor a mas seguro:
       1. DASH en proceso   -> 854x480 avc1 + audio m4a  (4-7 s)
@@ -372,14 +377,35 @@ def resolve_stream(video, quality=480):
         r = _resolve_subprocess(video, quality, hq)
         if r is not None:
             return r
-    return None, None
+    return None, None, None
+
+
+def _pick_urls(info):
+    """(video_url, audio_url, user_agent) desde un info dict de yt-dlp."""
+    ua = (info.get("http_headers") or {}).get("User-Agent")
+    req = info.get("requested_formats")
+    if req:
+        vurl = aurl = None
+        for f in req:
+            if f.get("vcodec") not in (None, "none") and not vurl:
+                vurl = f.get("url")
+                ua = (f.get("http_headers") or {}).get("User-Agent") or ua
+            elif not aurl:
+                aurl = f.get("url")
+        if vurl:
+            return vurl, aurl, ua
+    url = info.get("url")
+    return (url, None, ua) if url else None
 
 
 def _resolve_subprocess(video, quality, hq):
-    """Resolucion lanzando yt-dlp como proceso. None si falla."""
+    """Resolucion lanzando yt-dlp como proceso. None si falla.
+
+    Usa --dump-json (no -g) para obtener tambien http_headers: sin el
+    User-Agent correcto googlevideo responde 403 al reproductor."""
     opts = _stream_opts(quality, hq)
     cmd = _ytdlp_cmd() + [
-        "-f", opts["format"], "-g", "--no-warnings",
+        "-f", opts["format"], "--dump-json", "--no-warnings",
         "--no-check-certificates", "--no-playlist"]
     if not hq:
         cmd += ["--extractor-args", "youtube:player_client=android,web"]
@@ -389,11 +415,13 @@ def _resolve_subprocess(video, quality, hq):
                              stderr=subprocess.DEVNULL, timeout=90).stdout
     except (subprocess.TimeoutExpired, OSError):
         return None
-    lines = out.decode(errors="replace").strip().splitlines()
-    lines = [l for l in lines if l.startswith("http")]
-    if not lines:
+    try:
+        info = json.loads(out.decode(errors="replace"))
+    except ValueError:
         return None
-    return lines[0], (lines[1] if len(lines) > 1 else None)
+    if not info:
+        return None
+    return _pick_urls(info)
 
 
 def _resolve_inprocess(video, quality, hq=True):
@@ -409,19 +437,7 @@ def _resolve_inprocess(video, quality, hq=True):
             return None
     if not info:
         return None
-    # DASH: yt-dlp deja los dos formatos elegidos en requested_formats.
-    req = info.get("requested_formats")
-    if req:
-        vurl = aurl = None
-        for f in req:
-            if f.get("vcodec") not in (None, "none") and not vurl:
-                vurl = f.get("url")
-            elif not aurl:
-                aurl = f.get("url")
-        if vurl:
-            return vurl, aurl
-    url = info.get("url")
-    return (url, None) if url else None
+    return _pick_urls(info)
 
 
 def channel_of(video_id):
@@ -739,4 +755,138 @@ def fetch_thumbnail(url, dest, timeout=8):
         return True
     except Exception:
         return False
+
+
+# ---------- relay local para el reproductor ----------
+# googlevideo devuelve 403 a las peticiones de video abiertas: sin Range o
+# con "Range: bytes=X-" (lo que envia ffmpeg siempre). Solo acepta rangos
+# ACOTADOS ("bytes=X-Y"), la misma medida que yt-dlp esquiva con su
+# http_chunk_size. Ademas la huella TLS del ffmpeg 4.1 de la consola cae en
+# otro bloqueo. El relay resuelve ambos: escucha en 127.0.0.1, trocea cada
+# peticion abierta de mpv en rangos acotados contra googlevideo (via urllib,
+# cuya pila TLS si pasa) y entrega a mpv un stream continuo. El header Range
+# de mpv se respeta, asi que el seek sigue funcionando.
+# tamano de cada rango acotado: googlevideo acepta hasta ~2 MiB por rango
+# (probado: 2 MiB -> 206, 8 MiB -> 403)
+RELAY_CHUNK = 2 * 1024 * 1024
+
+
+class StreamRelay(object):
+    """Proxy HTTP minimo: /v -> URL de video, /a -> URL de audio."""
+
+    def __init__(self, video_url, audio_url=None, user_agent=None):
+        import http.server
+        import socketserver
+
+        upstream = {"/v": video_url}
+        if audio_url:
+            upstream["/a"] = audio_url
+        ua = user_agent or "Mozilla/5.0"
+
+        def fetch(url, start, end):
+            """GET acotado. Devuelve (respuesta, total) o (None, codigo)."""
+            req = urllib.request.Request(url, headers={
+                "User-Agent": ua,
+                "Range": "bytes=%d-%d" % (start, end)})
+            try:
+                src = urllib.request.urlopen(req, timeout=20,
+                                             context=SSL_CTX)
+            except urllib.error.HTTPError as e:
+                return None, e.code
+            except (urllib.error.URLError, OSError):
+                return None, 502
+            # Content-Range: bytes X-Y/TOTAL
+            cr = src.headers.get("Content-Range", "")
+            total = None
+            if "/" in cr:
+                try:
+                    total = int(cr.rsplit("/", 1)[1])
+                except ValueError:
+                    pass
+            return src, total
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):     # noqa: N802
+                pass
+
+            def do_GET(self):              # noqa: N802
+                url = upstream.get(self.path.split("?")[0])
+                if not url:
+                    self.send_error(404)
+                    return
+                # Range del cliente (mpv): "bytes=X-" o "bytes=X-Y"
+                start, req_end = 0, None
+                rng = self.headers.get("Range", "")
+                m = re.match(r"bytes=(\d+)-(\d*)", rng)
+                if m:
+                    start = int(m.group(1))
+                    if m.group(2):
+                        req_end = int(m.group(2))
+
+                # primer trozo: tambien informa del tamano total
+                src, total = fetch(url, start,
+                                   start + RELAY_CHUNK - 1 if req_end is None
+                                   else min(req_end, start + RELAY_CHUNK - 1))
+                if src is None:
+                    self.send_error(total if total >= 400 else 502)
+                    return
+                if total is None:          # sin Content-Range: reenviar tal cual
+                    total = start + int(src.headers.get("Content-Length") or 0)
+                end = total - 1 if req_end is None else min(req_end, total - 1)
+
+                try:
+                    if m:
+                        self.send_response(206)
+                        self.send_header("Content-Range", "bytes %d-%d/%d"
+                                         % (start, end, total))
+                    else:
+                        self.send_response(200)
+                    ctype = src.headers.get("Content-Type")
+                    if ctype:
+                        self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(end - start + 1))
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.end_headers()
+
+                    pos = start
+                    while pos <= end:
+                        if src is None:
+                            src, _ = fetch(url, pos,
+                                           min(pos + RELAY_CHUNK - 1, end))
+                            if src is None:
+                                return     # upstream caido a mitad
+                        while True:
+                            chunk = src.read(64 * 1024)
+                            if not chunk:
+                                break
+                            pos += len(chunk)
+                            self.wfile.write(chunk)
+                        src.close()
+                        src = None
+                except (OSError, ValueError):
+                    pass               # mpv corto la conexion (seek o salida)
+                finally:
+                    if src is not None:
+                        src.close()
+
+        class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+        self._srv = Server(("127.0.0.1", 0), Handler)
+        self.port = self._srv.server_address[1]
+        self.video_url = "http://127.0.0.1:%d/v" % self.port
+        self.audio_url = ("http://127.0.0.1:%d/a" % self.port
+                          if audio_url else None)
+        t = threading.Thread(target=self._srv.serve_forever, daemon=True)
+        t.start()
+
+    def close(self):
+        try:
+            self._srv.shutdown()
+            self._srv.server_close()
+        except Exception:                  # noqa: BLE001
+            pass
 

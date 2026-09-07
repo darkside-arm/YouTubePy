@@ -10,6 +10,9 @@ name: Publicar release (yt-dlp aarch64 + codigo)
 #                           SHA-256), listo para descomprimir en /roms/ports
 #   - mpv-aarch64.zip       dependencia OPCIONAL; la app se la descarga sola
 #                           si la consola no trae reproductor
+#   - yt-dlp_linux_aarch64  binario PyInstaller (~40 MB) para consolas con
+#                           Python < 3.10, donde el zipapp no importa; se
+#                           copia a mano como youtube_py/yt-dlp.real
 # Ademas mantiene el tag movil "ytdlp-latest" con los mismos assets, para
 # tener una URL de descarga estable (es la que usa la app para bajar mpv).
 #
@@ -59,6 +62,25 @@ jobs:
           unzip -l yt-dlp | grep -q '__main__.py'
           python3 -c "import sys; sys.path.insert(0,'yt-dlp'); import yt_dlp; \
                       print('zipapp ok:', yt_dlp.version.__version__)"
+
+      - name: Descargar y verificar yt-dlp (binario aarch64)
+        env:
+          V: ${{ steps.up.outputs.version }}
+        run: |
+          # Binario PyInstaller (~40 MB) para consolas con Python < 3.10,
+          # donde el zipapp no importa ("Only Python versions 3.10 and above
+          # are supported"). Va como asset SEPARADO del release, no dentro del
+          # zip del port: solo lo necesitan esas consolas, y ahi se copia a
+          # mano como youtube_py/yt-dlp.real (util cuando la consola no llega
+          # a GitHub y la descarga automatica de la app no puede funcionar).
+          base="https://github.com/yt-dlp/yt-dlp/releases/download/$V"
+          curl -fsSL --retry 5 --retry-delay 5 \
+               -o yt-dlp_linux_aarch64 "$base/yt-dlp_linux_aarch64"
+          grep " yt-dlp_linux_aarch64$" SHA2-256SUMS > expected-bin.sha256
+          sha256sum -c expected-bin.sha256
+          [ "$(stat -c%s yt-dlp_linux_aarch64)" -ge 10000000 ] \
+            || { echo "binario demasiado pequeno"; exit 1; }
+          file yt-dlp_linux_aarch64 | grep -qi aarch64
 
       - name: Construir dependencia mpv-aarch64.zip
         run: |
@@ -157,8 +179,14 @@ jobs:
           PyInstaller (~36 MB): la app lo importa en su propio proceso y se
           ahorra ~6 s de arranque de interprete en cada video.
 
+          **Consolas con Python < 3.10** (el zipapp no funciona ahi): copiar
+          el asset \`yt-dlp_linux_aarch64\` a la consola como
+          \`/roms/ports/youtube_py/yt-dlp.real\` (chmod +x). La app tambien
+          intenta descargarlo sola, pero eso requiere acceso a GitHub desde
+          la consola.
+
           Upstream: https://github.com/yt-dlp/yt-dlp/releases/tag/$V" \
-            "$ZIP" mpv-aarch64.zip
+            "$ZIP" mpv-aarch64.zip yt-dlp_linux_aarch64
 
       - name: Actualizar tag movil ytdlp-latest
         env:
@@ -179,5 +207,9 @@ jobs:
 
           \`mpv-aarch64.zip\` es una **dependencia opcional**: la app se la
           descarga sola desde este tag cuando la consola no trae mpv. No hay
-          que instalarla a mano ni tocar el sistema." \
-            YouTubePy-latest.zip mpv-aarch64.zip
+          que instalarla a mano ni tocar el sistema.
+
+          \`yt-dlp_linux_aarch64\` es para **consolas con Python < 3.10**
+          (el zipapp no funciona ahi): copiarlo a la consola como
+          \`/roms/ports/youtube_py/yt-dlp.real\` (chmod +x)." \
+            YouTubePy-latest.zip mpv-aarch64.zip yt-dlp_linux_aarch64

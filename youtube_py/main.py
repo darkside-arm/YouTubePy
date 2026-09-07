@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
@@ -317,15 +318,20 @@ def _osd_args():
     ]
 
 
-def _player_cmd(name, path, url, audio_url, aspect=0):
+def _player_cmd(name, path, url, audio_url, aspect=0, user_agent=None):
     """Linea de comandos de mpv, con la pista de audio separada cuando el
-    formato es DASH (audio_url no es None)."""
+    formato es DASH (audio_url no es None).
+
+    user_agent es el UA con el que yt-dlp resolvio la URL: googlevideo liga
+    la URL firmada al cliente y responde 403 si mpv la pide con su UA."""
     extra = CFG.get("video", {}).get(name + "_args", [])
     cmd = [path, "--fs", "--no-terminal", "--really-quiet",
            "--input-ipc-server=" + MPV_SOCKET,
            # Aviso al empezar: sin barra de ayuda durante el video, nadie
            # adivinaria que A pausa o que Y cambia el encaje.
            "--osd-playing-msg=" + T("osd_hint")]
+    if user_agent:
+        cmd.append("--user-agent=" + user_agent)
     cmd += _osd_args()
     cmd += ASPECT_MODES[aspect % len(ASPECT_MODES)][2]
     if audio_url:
@@ -470,7 +476,7 @@ DL_TEXTS = {
     "en": {
         "title": "Downloading yt-dlp (video engine)",
         "fail": "Download failed (no WiFi or GitHub down)",
-        "manual": [
+        "manual_zip": [
             "Manual install:",
             "1. Download yt-dlp (the plain python zipapp):",
             "   github.com/yt-dlp/yt-dlp/releases",
@@ -479,12 +485,20 @@ DL_TEXTS = {
             "   /roms/ports/youtube_py/yt-dlp.zip",
             "3. Make it executable: chmod +x yt-dlp.zip",
         ],
+        "manual_bin": [
+            "Manual install (this Python needs the binary):",
+            "1. Download yt-dlp_linux_aarch64 (about 40 MB):",
+            "   github.com/yt-dlp/yt-dlp/releases",
+            "2. Save it on the console as:",
+            "   /roms/ports/youtube_py/yt-dlp.real",
+            "3. Make it executable: chmod +x yt-dlp.real",
+        ],
         "retry": "A: retry   B: continue without playback   Y: Espanol",
     },
     "es": {
         "title": "Descargando yt-dlp (motor de video)",
         "fail": "Fallo la descarga (sin WiFi o GitHub caido)",
-        "manual": [
+        "manual_zip": [
             "Instalacion manual:",
             "1. Descargar yt-dlp (el zipapp de python puro):",
             "   github.com/yt-dlp/yt-dlp/releases",
@@ -492,6 +506,14 @@ DL_TEXTS = {
             "2. Guardarlo en la consola como:",
             "   /roms/ports/youtube_py/yt-dlp.zip",
             "3. Permisos de ejecucion: chmod +x yt-dlp.zip",
+        ],
+        "manual_bin": [
+            "Instalacion manual (este Python necesita el binario):",
+            "1. Descargar yt-dlp_linux_aarch64 (unos 40 MB):",
+            "   github.com/yt-dlp/yt-dlp/releases",
+            "2. Guardarlo en la consola como:",
+            "   /roms/ports/youtube_py/yt-dlp.real",
+            "3. Permisos de ejecucion: chmod +x yt-dlp.real",
         ],
         "retry": "A: reintentar   B: continuar sin reproduccion   Y: English",
     },
@@ -706,6 +728,13 @@ class App(object):
         self.section = "Home"
         self.search_token = None      # continuacion de busqueda innertube
         self.feed_offset = 0          # paginacion del home
+        # Pre-resolucion del video seleccionado (ver _prefetch_tick): en
+        # consolas sin motor en proceso cada resolucion paga ~6 s de
+        # arranque de yt-dlp; resolverla mientras el usuario mira la lista
+        # hace que el play sea (casi) instantaneo.
+        self._prefetch = {}           # video.id -> (url, audio, ua, ts)
+        self._prefetch_busy = [None]  # id en resolucion, o None
+        self._sel_since = [None, 0.0]  # (video.id, monotonic del cambio)
         self.loading_more = False
         self.refreshing = False       # START: refresco del feed en curso
         self.aspect = self._load_aspect()   # modo de encaje del video
@@ -791,7 +820,7 @@ class App(object):
                             lang[0] = "es" if lang[0] == "en" else "en"
                 t = DL_TEXTS[lang[0]]
                 self._draw_frame()
-                mw, mh = 470, 260
+                mw, mh = 520, 300
                 mx0 = UX + (UW - mw) // 2
                 my0 = UY + (UH - mh) // 2
                 self._fill(UX, UY, UW, UH, (0, 0, 0), 150)
@@ -799,10 +828,14 @@ class App(object):
                 self.text.draw(t["fail"], mx0 + 20, my0 + 14, 14,
                                (230, 200, 60))
                 y = my0 + 46
-                for line in t["manual"]:
-                    self.text.draw(line, mx0 + 20, y, 12)
-                    y += 20
-                self.text.draw(t["retry"], mx0 + 20, my0 + mh - 26, 11, C_DIM)
+                # Instrucciones segun el motor que aplica a este Python:
+                # zipapp (3.10+) o binario PyInstaller (yt-dlp.real).
+                manual = t["manual_zip"] if backend._use_zipapp() \
+                    else t["manual_bin"]
+                for line in manual:
+                    self.text.draw(line, mx0 + 20, y, 16)
+                    y += 26
+                self.text.draw(t["retry"], mx0 + 20, my0 + mh - 30, 15, C_DIM)
                 sdl2.SDL_RenderPresent(self.ren)
                 sdl2.SDL_Delay(50)
             if choice[0] == "skip":
@@ -1060,27 +1093,102 @@ class App(object):
             return False
         return True
 
+    # ---------- pre-resolucion del video seleccionado ----------
+    PREFETCH_DEBOUNCE = 0.6    # s quieto sobre un video antes de resolver
+    PREFETCH_TTL = 3600        # s de validez del resultado (las URL duran ~6 h)
+
+    def _sel_video(self):
+        """Video bajo el cursor, o None."""
+        if (self.in_sidebar or self.section == "Settings"
+                or not self.videos or self.grid_idx >= len(self.videos)):
+            return None
+        v = self.videos[self.grid_idx]
+        return None if v.is_notice else v
+
+    def _prefetch_get(self, video_id):
+        """Resultado pre-resuelto y fresco, o None."""
+        hit = self._prefetch.get(video_id)
+        if hit and time.monotonic() - hit[3] < self.PREFETCH_TTL:
+            return hit
+        self._prefetch.pop(video_id, None)
+        return None
+
+    def _prefetch_tick(self):
+        """Llamado en cada vuelta del main loop. Si el cursor lleva un rato
+        quieto sobre un video sin resolver, lo resuelve en background: en
+        consolas sin motor en proceso cada resolucion paga ~6 s de arranque
+        de yt-dlp, y pagarlos aqui hace el play (casi) instantaneo."""
+        v = self._sel_video()
+        now = time.monotonic()
+        if v is None or self._prefetch_busy[0]:
+            return
+        if self._sel_since[0] != v.id:
+            self._sel_since[:] = [v.id, now]
+            return
+        if now - self._sel_since[1] < self.PREFETCH_DEBOUNCE:
+            return
+        if self._prefetch_get(v.id):
+            return
+        self._prefetch_busy[0] = v.id
+
+        def worker():
+            try:
+                url, audio, ua = backend.resolve_stream(v, CFG["quality"])
+                if url:
+                    self._prefetch[v.id] = (url, audio, ua, time.monotonic())
+                    # sin limpieza sofisticada: con quedarse las 8 ultimas basta
+                    while len(self._prefetch) > 8:
+                        oldest = min(self._prefetch,
+                                     key=lambda k: self._prefetch[k][3])
+                        del self._prefetch[oldest]
+            finally:
+                self._prefetch_busy[0] = None
+        threading.Thread(target=worker, daemon=True).start()
+
     def play(self, video):
         if video.is_notice:
             return
-        # resolver stream en hilo, con spinner animado en pantalla
         result = {}
-
-        def worker():
-            result["url"], result["audio"] = backend.resolve_stream(
-                video, CFG["quality"])
-        th = threading.Thread(target=worker, daemon=True)
-        th.start()
-        frame = 0
-        ev = sdl2.SDL_Event()
-        while th.is_alive() and self.running:
-            while sdl2.SDL_PollEvent(ctypes.byref(ev)):
-                pass
-            self._draw_frame()
-            self._draw_loading("Cargando video", frame)
-            sdl2.SDL_RenderPresent(self.ren)
-            frame += 1
-            sdl2.SDL_Delay(80)
+        hit = self._prefetch_get(video.id)
+        if hit:
+            _vlog("play: URL pre-resuelta para %s" % video.id)
+            result["url"], result["audio"], result["ua"] = hit[:3]
+        elif self._prefetch_busy[0] == video.id:
+            # ya se esta resolviendo: esperar a ese hilo en vez de lanzar
+            # una segunda resolucion identica
+            frame = 0
+            ev = sdl2.SDL_Event()
+            while self._prefetch_busy[0] == video.id and self.running:
+                while sdl2.SDL_PollEvent(ctypes.byref(ev)):
+                    pass
+                self._draw_frame()
+                self._draw_loading("Cargando video", frame)
+                sdl2.SDL_RenderPresent(self.ren)
+                frame += 1
+                sdl2.SDL_Delay(80)
+            hit = self._prefetch_get(video.id)
+            if hit:
+                result["url"], result["audio"], result["ua"] = hit[:3]
+        if not result.get("url"):
+            # resolver stream en hilo, con spinner animado en pantalla
+            def worker():
+                result["url"], result["audio"], result["ua"] = \
+                    backend.resolve_stream(video, CFG["quality"])
+            th = threading.Thread(target=worker, daemon=True)
+            th.start()
+            frame = 0
+            ev = sdl2.SDL_Event()
+            while th.is_alive() and self.running:
+                while sdl2.SDL_PollEvent(ctypes.byref(ev)):
+                    pass
+                self._draw_frame()
+                self._draw_loading("Cargando video", frame)
+                sdl2.SDL_RenderPresent(self.ren)
+                frame += 1
+                sdl2.SDL_Delay(80)
+            if result.get("url"):
+                self._prefetch[video.id] = (result["url"], result["audio"],
+                                            result.get("ua"), time.monotonic())
         url = result.get("url")
         if not url:
             self.status = T("no_video")
@@ -1098,13 +1206,24 @@ class App(object):
         self.history = [video] + [v for v in self.history if v.id != video.id]
         self._save_json("history.json", self.history[:100])
         self._close_display()
+        relay = None
         try:
             try:
                 os.remove(MPV_SOCKET)      # restos de una sesion anterior
             except OSError:
                 pass
-            cmdline = _player_cmd(name, path, url, result.get("audio"),
-                                  self.aspect)
+            # Relay local: googlevideo rechaza (403) la pila TLS del ffmpeg
+            # viejo de la consola; las peticiones las hace python y mpv lee
+            # de 127.0.0.1 (ver backend.StreamRelay).
+            audio = result.get("audio")
+            try:
+                relay = backend.StreamRelay(url, audio, result.get("ua"))
+                url, audio = relay.video_url, relay.audio_url
+                _vlog("relay local en puerto %d" % relay.port)
+            except OSError:
+                relay = None               # sin relay: intento directo
+            cmdline = _player_cmd(name, path, url, audio,
+                                  self.aspect, result.get("ua"))
             _vlog("lanzando: %s" % " ".join(
                 a for a in cmdline if a.startswith("--") or a == path))
             proc = subprocess.Popen(cmdline, env=_player_env())
@@ -1137,6 +1256,8 @@ class App(object):
                 was = now
                 sdl2.SDL_Delay(50)
         finally:
+            if relay:
+                relay.close()
             # esperar a que se suelte B para que no llegue a la UI
             while self.pad:
                 sdl2.SDL_GameControllerUpdate()
@@ -1556,7 +1677,7 @@ class App(object):
 
     def _modal_box(self, title, lines, footer):
         """Dibuja (sin bloquear) una caja modal con titulo, texto y pie."""
-        mw, mh = 470, 220
+        mw, mh = 520, 260
         mx0 = UX + (UW - mw) // 2
         my0 = UY + (UH - mh) // 2
         self._draw_frame()
@@ -1565,9 +1686,9 @@ class App(object):
         self.text.draw(title, mx0 + 20, my0 + 14, 14, (230, 200, 60))
         y = my0 + 46
         for line in lines:
-            self.text.draw(line, mx0 + 20, y, 12)
-            y += 20
-        self.text.draw(footer, mx0 + 20, my0 + mh - 26, 11, C_DIM)
+            self.text.draw(line, mx0 + 20, y, 16)
+            y += 26
+        self.text.draw(footer, mx0 + 20, my0 + mh - 30, 15, C_DIM)
 
     def _error_modal(self, title, lines, footer="A / B = salir"):
         """Ventana de error bloqueante. Devuelve al pulsar A o B."""
@@ -1755,6 +1876,7 @@ class App(object):
                         self.handle(b)
                 elif ev.type == sdl2.SDL_CONTROLLERDEVICEADDED:
                     self._open_pad()
+            self._prefetch_tick()
             self._render()
             sdl2.SDL_Delay(33)
         sdl2.SDL_Quit()
