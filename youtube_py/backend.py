@@ -20,8 +20,17 @@ if not os.path.exists(YTDLP):
 # interprete), mientras que el zipapp se importa una sola vez al arrancar.
 YTDLP_ZIP = os.path.join(BASE, "yt-dlp.zip")
 COOKIES = os.path.join(BASE, "cookies.txt")
-if not os.path.exists(COOKIES):
-    COOKIES = "/roms/ports/youtube/cookies.txt"
+_COOKIES_LEGACY = "/roms/ports/youtube/cookies.txt"
+
+
+def _cookies_path():
+    """Ruta al cookies.txt existente, o None. Se re-evalua en cada llamada
+    para que copiar el archivo con la app abierta funcione sin reiniciar."""
+    if os.path.exists(COOKIES):
+        return COOKIES
+    if os.path.exists(_COOKIES_LEGACY):
+        return _COOKIES_LEGACY
+    return None
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -263,7 +272,7 @@ def _flat_inprocess(url_or_query, limit, use_cookies, offset):
 
     Evita lanzar un subproceso, que en esta CPU cuesta ~6 s y satura los 4
     nucleos justo cuando se estan bajando las miniaturas."""
-    cookies = use_cookies and os.path.exists(COOKIES)
+    cookies = _cookies_path() if use_cookies else None
     # Una sola instancia por modo (con o sin cookies). El rango se cambia
     # mutando params en cada llamada: cachear una instancia por cada offset
     # iria acumulando objetos YoutubeDL segun se pagina.
@@ -271,7 +280,7 @@ def _flat_inprocess(url_or_query, limit, use_cookies, offset):
     with _YDL_LOCK:
         opts = {"extract_flat": "in_playlist", "ignoreerrors": True}
         if cookies:
-            opts["cookiefile"] = COOKIES
+            opts["cookiefile"] = cookies
         ydl = _get_ydl(key, opts)
         if ydl is None:
             return None
@@ -301,8 +310,9 @@ def _ytdlp_flat(url_or_query, limit, use_cookies, offset=0):
         "--ignore-errors", "--no-check-certificates",
         "--playlist-items", "%d-%d" % (offset + 1, offset + limit),
         "--socket-timeout", "15"]
-    if use_cookies and os.path.exists(COOKIES):
-        cmd += ["--cookies", COOKIES]
+    ck = _cookies_path() if use_cookies else None
+    if ck:
+        cmd += ["--cookies", ck]
     cmd.append(url_or_query)
     try:
         out = subprocess.run(cmd, stdout=subprocess.PIPE,
@@ -323,7 +333,7 @@ def _ytdlp_flat(url_or_query, limit, use_cookies, offset=0):
 
 def home_feed(limit=20, offset=0):
     """Devuelve (videos, estado_cookies): 'ok', 'missing' o 'expired'."""
-    if os.path.exists(COOKIES):
+    if _cookies_path():
         vids = _ytdlp_flat(":ytrec", limit, use_cookies=True, offset=offset)
         if vids:
             return vids, "ok"
@@ -446,7 +456,14 @@ def _use_zipapp():
 
 
 def ytdlp_present():
-    return os.path.exists(YTDLP_ZIP) or os.path.exists(YTDLP)
+    """True si hay un motor yt-dlp USABLE en este Python.
+
+    El zipapp solo cuenta con Python >= 3.10: en versiones anteriores su
+    guardia interno lanza ImportError, asi que tenerlo en disco no sirve de
+    nada y hay que bajar el binario PyInstaller (yt-dlp.real)."""
+    if _use_zipapp() and os.path.exists(YTDLP_ZIP):
+        return True
+    return os.path.exists(YTDLP)
 
 
 def _curl_text(url, timeout=15):
